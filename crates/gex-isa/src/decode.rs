@@ -1655,6 +1655,17 @@ fn decode_simd_scalar(raw: u32, u: u32) -> Option<Inst> {
         }
     };
 
+    // Floating point by element: 01 U 11111 1 sz L M Rm opcode H 0 Rn Rd. The integer forms
+    // (`sqdmulh` and its family) go on to be refused.
+    if bits(raw, 28, 24) == 0b11111 && bit(raw, 23) == 1 && bit(raw, 10) == 0 {
+        if let Some(Inst::VByElement { op, mut arr, vd, vn, vm, index }) = decode_simd_by_element(raw, true, u) {
+            if arr.float {
+                arr.scalar = true;
+                return Some(Inst::VByElement { op, arr, vd, vn, vm, index });
+            }
+        }
+    }
+
     // Shift by immediate: 01 U 111110 immh immb opcode 1 Rn Rd
     if bits(raw, 28, 23) == 0b111110 && bit(raw, 10) == 1 {
         let immh = bits(raw, 22, 19);
@@ -1749,6 +1760,8 @@ fn scalar_form_exists(inst: &Inst) -> bool {
             | VOp3::FCmGt
             | VOp3::FRecps
             | VOp3::FRSqrts
+            | VOp3::FAcGe
+            | VOp3::FAcGt
             | VOp3::FAbd => true,
             _ => false,
         },
@@ -2063,6 +2076,10 @@ fn decode_simd_three_same(raw: u32, q: bool, u: u32) -> Inst {
             (1, 0b11100, false) => VOp3::FCmGe,
             (1, 0b11100, true) => VOp3::FCmGt,
             (1, 0b11111, false) => VOp3::FDiv,
+            (1, 0b11110, false) => VOp3::FMaxP,
+            (1, 0b11110, true) => VOp3::FMinP,
+            (1, 0b11101, false) => VOp3::FAcGe,
+            (1, 0b11101, true) => VOp3::FAcGt,
             _ => return Inst::Unknown { raw },
         };
         // No `.1d` arrangement.
@@ -2362,6 +2379,8 @@ fn decode_simd_across(raw: u32, q: bool, u: u32) -> Inst {
         (0b11010, 0) => VAcrossOp::SMin,
         (0b11010, _) => VAcrossOp::UMin,
         (0b11011, 0) => VAcrossOp::Add,
+        (0b00011, 0) => VAcrossOp::SAddLv,
+        (0b00011, _) => VAcrossOp::UAddLv,
         _ => return Inst::Unknown { raw },
     };
     let lane_bytes = match bits(raw, 23, 22) {
@@ -3000,6 +3019,54 @@ mod tests {
 
     fn d(raw: u32) -> Inst {
         decode(raw, 0x1000)
+    }
+
+    #[test]
+    fn scalar_floating_point_by_element() {
+        // fmul s0, s1, v0.s[0].
+        match d(0x5f809020) {
+            Inst::VByElement { op, arr, vd, vn, vm, index } => {
+                assert_eq!(op, VOp3::FMul);
+                assert!(arr.scalar && arr.float);
+                assert_eq!(arr.lane_bytes, 4);
+                assert_eq!((vd.0, vn.0, vm.0, index), (0, 1, 0, 0));
+            }
+            other => panic!("expected scalar fmul by element, got {other:?}"),
+        }
+        // fmla s2, s1, v0.s[2].
+        match d(0x5f801822) {
+            Inst::VByElement { op, arr, index, .. } => {
+                assert_eq!((op, arr.scalar, index), (VOp3::FMla, true, 2));
+            }
+            other => panic!("expected scalar fmla by element, got {other:?}"),
+        }
+        // fmls s4, s2, v0.s[2].
+        assert!(matches!(d(0x5f805844), Inst::VByElement { op: VOp3::FMls, .. }));
+    }
+
+    #[test]
+    fn floating_point_pairwise_and_absolute_compare() {
+        assert!(matches!(d(0x2e20f400), Inst::VThreeSame { op: VOp3::FMaxP, .. }));
+        assert!(matches!(d(0x2ea0f400), Inst::VThreeSame { op: VOp3::FMinP, .. }));
+        assert!(matches!(d(0x2ea5ee91), Inst::VThreeSame { op: VOp3::FAcGt, .. }));
+        assert!(matches!(d(0x2e25ee91), Inst::VThreeSame { op: VOp3::FAcGe, .. }));
+    }
+
+    #[test]
+    fn add_long_across_lanes() {
+        // uaddlv h0, v0.8b -- raised SIGILL as Unknown.
+        match d(0x2e303800) {
+            Inst::VAcross { op, arr, vd, vn } => {
+                assert_eq!(op, VAcrossOp::UAddLv);
+                assert_eq!(arr.lane_bytes, 1);
+                assert!(!arr.q);
+                assert_eq!((vd.0, vn.0), (0, 0));
+            }
+            other => panic!("expected VAcross uaddlv, got {other:?}"),
+        }
+        // saddlv s0, v0.8h, and uaddlv h1, v2.16b.
+        assert!(matches!(d(0x0e703800), Inst::VAcross { op: VAcrossOp::SAddLv, .. }));
+        assert!(matches!(d(0x6e303841), Inst::VAcross { op: VAcrossOp::UAddLv, .. }));
     }
 
     #[test]

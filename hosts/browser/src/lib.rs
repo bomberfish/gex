@@ -15908,6 +15908,18 @@ pub extern "C" fn gex_sysreg_read(_ctx: i32, _pc: i64, reg: i32) -> i64 {
 }
 #[no_mangle]
 pub extern "C" fn gex_sysreg_write(ctx: i32, pc: i64, reg: i32, val: i64) {
+    // A SIMD or crypto instruction with no wasm form, on the registers the call flushed. FPSR.QC
+    // lands in the context, the only place that holds it: the lifter's own saturating lowerings
+    // do not record it, and an MRS of FPSR reads 0 either way.
+    if reg == gex_isa::slow::SYSREG {
+        let at = ctx as u32 as usize;
+        let mem = guest_bytes();
+        let mut fpsr = u32::from_le_bytes(mem[at + ctx::FPSR..at + ctx::FPSR + 4].try_into().unwrap());
+        let done = gex_isa::slow::execute(val as u32, &mut gex_isa::slow::VRegs(&mut mem[at + ctx::V..at + ctx::V + 512]), &mut fpsr);
+        debug_assert!(done, "the lifter asked only for what `known` said");
+        mem[at + ctx::FPSR..at + ctx::FPSR + 4].copy_from_slice(&fpsr.to_le_bytes());
+        return;
+    }
     let pc = fault_pc(pc);
     // A gex-eject library replacement (`Intrinsic::Replace`). This shim has no
     // replacement modules to run it with (eject v0 runs them natively only),

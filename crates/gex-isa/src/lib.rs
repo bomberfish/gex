@@ -14,6 +14,7 @@
 
 pub mod decode;
 pub mod fmt;
+pub mod slow;
 
 pub use decode::decode;
 
@@ -1260,6 +1261,12 @@ pub enum VOp3 {
     FMaxNm,
     FMinNm,
     FAddP,
+    /// `fmaxp`/`fminp`: NaN-propagating maximum and minimum of adjacent lanes.
+    FMaxP,
+    FMinP,
+    /// `facge`/`facgt`: compare absolute values.
+    FAcGe,
+    FAcGt,
     FMla,
     FMls,
     FCmEq,
@@ -1375,6 +1382,9 @@ pub enum VWidenOp {
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum VAcrossOp {
     Add,
+    /// `saddlv`/`uaddlv`: every lane added into one scalar of twice the lane's width.
+    SAddLv,
+    UAddLv,
     SMax,
     SMin,
     UMax,

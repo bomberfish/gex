@@ -17,6 +17,7 @@ wasm-encoder = "0.219.2"
 gex-wayland.workspace = true
 gex-xwm.workspace = true
 gex-xlate = { workspace = true, features = ["fjit"] }
+gex-isa = { workspace = true }
 gex-ld.workspace = true
 gex-cgen.workspace = true
 gex-dylink.workspace = true

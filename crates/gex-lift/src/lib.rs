@@ -572,7 +572,28 @@ impl<'a> Lifter<'a> {
     // -- the dispatcher ----------------------------------------------------
 
     /// Lift one instruction located at `pc`. Returns how the block continues.
+    /// One instruction. A word with no lowering that [`gex_isa::slow`] understands is carried
+    /// out by the host; the rest of the refusals stay refusals, for the caller to make a SIGILL.
     pub fn lift(&mut self, inst: &Inst, pc: u64) -> Flow {
+        let mark = self.b.mark();
+        let flags = self.flags;
+        let flow = self.lift_inst(inst, pc);
+        let raw = self.raw;
+        let refused = self.b.has_inexpressible(mark)
+            || matches!(flow, Flow::End(Term::Illegal { raw: r, pc: p }) if r == raw && p == pc);
+        if !refused || !gex_isa::slow::known(raw) {
+            return flow;
+        }
+        self.b.rewind(mark);
+        self.flags = flags;
+        let pcv = self.b.const_i64(pc);
+        let id = self.b.const_i32(gex_isa::slow::SYSREG as u32);
+        let word = self.b.const_i64(raw as u64);
+        self.b.stmt(Stmt::HostCall { func: HostFunc::SysRegWrite, args: vec![pcv, id, word] });
+        Flow::Next
+    }
+
+    fn lift_inst(&mut self, inst: &Inst, pc: u64) -> Flow {
         let next = pc + INST_BYTES;
         match *inst {
             Inst::Unknown { raw } | Inst::Undefined { raw } => Flow::End(Term::Illegal { raw, pc }),
@@ -1413,78 +1434,12 @@ impl<'a> Lifter<'a> {
                 neg_product,
                 neg_addend,
             } => {
-                // AArch64 fuses this (one rounding); wasm has no FMA and
-                // rounding the product first is enough to break musl's `pow`,
-                // which is built on it. So the host's FMA is called.
-                let double = sz.is_double();
                 let a = self.rd_fp(vn, sz);
                 let b = self.rd_fp(vm, sz);
                 let c = self.rd_fp(va, sz);
                 // Negating an operand of the product is exact, so it can be
                 // done before the fused step without changing the result.
-                let a = if neg_product {
-                    self.b.def(Expr::FpUn {
-                        op: FpUnOp::Neg,
-                        double,
-                        a,
-                    })
-                } else {
-                    a
-                };
-                let c = if neg_addend {
-                    self.b.def(Expr::FpUn {
-                        op: FpUnOp::Neg,
-                        double,
-                        a: c,
-                    })
-                } else {
-                    c
-                };
-                // GEX_INLINE_FMA emits a multiply and an add instead. Not
-                // correct -- it rounds twice -- and exists only to measure
-                // what the fused host call costs.
-                if inline_fma() {
-                    let prod = self.b.def(Expr::FpBin {
-                        op: FpBinOp::Mul,
-                        double,
-                        a,
-                        b,
-                    });
-                    let v = self.b.def(Expr::FpBin {
-                        op: FpBinOp::Add,
-                        double,
-                        a: prod,
-                        b: c,
-                    });
-                    self.wr_fp(vd, sz, v);
-                    return Flow::Next;
-                }
-                let (a64, b64, c64) = if double {
-                    (a, b, c)
-                } else {
-                    // The import speaks in 64-bit words; a single-precision
-                    // pattern rides in the low half.
-                    (
-                        self.b.def(Expr::Extend { a, signed: false }),
-                        self.b.def(Expr::Extend {
-                            a: b,
-                            signed: false,
-                        }),
-                        self.b.def(Expr::Extend {
-                            a: c,
-                            signed: false,
-                        }),
-                    )
-                };
-                let is_double = self.konst(Ty::I32, double as u64);
-                let r = self.b.def(Expr::HostCall {
-                    func: HostFunc::Fma,
-                    args: vec![a64, b64, c64, is_double],
-                    ty: Ty::I64,
-                });
-                let v = if double { r } else { self.b.def(Expr::Wrap(r)) };
-                self.wr_fp(vd, sz, v);
-                Flow::Next
+                self.fused(vd, sz, a, b, c, neg_product, neg_addend)
             }
 
             Inst::VByElement {
@@ -1495,6 +1450,22 @@ impl<'a> Lifter<'a> {
                 vm,
                 index,
             } => {
+                // Scalar `fmla`/`fmls` are fused, as `fmadd` is. (The vector forms round the
+                // product first: wasm has no vector FMA.)
+                if arr.scalar && matches!(op, VOp3::FMla | VOp3::FMls) {
+                    let sz = if arr.lane_bytes == 8 { FpSz::D } else { FpSz::S };
+                    let a = self.rd_fp(vn, sz);
+                    let m = self.b.read(GuestReg::V128(vm.0));
+                    let b = self.b.def(Expr::VExtract {
+                        a: m,
+                        lane: index,
+                        lane_bytes: arr.lane_bytes,
+                        signed: false,
+                        ty: if sz.is_double() { Ty::I64 } else { Ty::I32 },
+                    });
+                    let c = self.rd_fp(vd, sz);
+                    return self.fused(vd, sz, a, b, c, op == VOp3::FMls, false);
+                }
                 // Broadcast the chosen lane, then this is an ordinary
                 // three-same operation.
                 let src = self.b.read(GuestReg::V128(vm.0));
@@ -2241,6 +2212,45 @@ impl<'a> Lifter<'a> {
                 Flow::Next
             }
 
+            // `saddlv`/`uaddlv`: wasm's pairwise add widens each pair in place, and the sum of
+            // those cannot overflow the wider lane (16 bytes into 16 bits, 8 halfwords into 32),
+            // so the plain fold below finishes it on them. The upper half of a 64-bit form is
+            // not an input, so it is cleared first. Word lanes would take a 64-bit pairwise add
+            // wasm lacks, and have not been seen: refused, rather than guessed.
+            Inst::VAcross { op: op @ (VAcrossOp::SAddLv | VAcrossOp::UAddLv), arr, vd, vn } => {
+                let signed = op == VAcrossOp::SAddLv;
+                let pairwise = match (arr.lane_bytes, signed) {
+                    (1, true) => VUnOp::ExtAddPairwiseS8,
+                    (1, false) => VUnOp::ExtAddPairwiseU8,
+                    (2, true) => VUnOp::ExtAddPairwiseS16,
+                    (2, false) => VUnOp::ExtAddPairwiseU16,
+                    _ => return Flow::End(Term::Illegal { raw: self.raw, pc }),
+                };
+                let a = self.b.read(GuestReg::V128(vn.0));
+                let a = self.narrow_to_64(a, arr.q);
+                let mut acc = self.b.def(Expr::VUn { op: pairwise, a });
+                let lb = arr.lane_bytes * 2;
+                let lane = if lb == 2 { VLane::I16 } else { VLane::I32 };
+                let mut span = arr.lanes() / 2;
+                while span > 1 {
+                    let half = span / 2;
+                    let mut lanes = [0u8; 16];
+                    for (i, slot) in lanes.iter_mut().enumerate() {
+                        let i = i as u32;
+                        let l = i / lb;
+                        *slot = if l < half { ((l + half) * lb + i % lb) as u8 } else { i as u8 };
+                    }
+                    let shifted = self.b.def(Expr::VShuffle { a: acc, b: acc, lanes: Box::new(lanes) });
+                    acc = self.b.def(Expr::VLaneBin { op: VLaneBinOp::Add, lane, a: acc, b: shifted });
+                    span = half;
+                }
+                let value = self.b.def(Expr::VExtract { a: acc, lane: 0, lane_bytes: lb, signed: false, ty: Ty::I32 });
+                let zero = self.b.def(Expr::VConst(Box::new([0u8; 16])));
+                let out = self.b.def(Expr::VReplace { a: zero, lane: 0, lane_bytes: lb, val: value });
+                self.b.write(GuestReg::V128(vd.0), out);
+                Flow::Next
+            }
+
             Inst::VAcross { op, arr, vd, vn } => {
                 // Wasm has no horizontal reduction, so fold the vector in
                 // half repeatedly: log2(lanes) shuffles and lane-wise ops
@@ -2256,6 +2266,7 @@ impl<'a> Lifter<'a> {
                     VAcrossOp::SMin | VAcrossOp::FMin | VAcrossOp::FMinNm => VLaneBinOp::MinS,
                     VAcrossOp::UMax => VLaneBinOp::MaxU,
                     VAcrossOp::UMin => VLaneBinOp::MinU,
+                    VAcrossOp::SAddLv | VAcrossOp::UAddLv => unreachable!("taken above"),
                 };
                 let mut acc = self.b.read(GuestReg::V128(vn.0));
                 let lb = arr.lane_bytes;
@@ -2943,6 +2954,14 @@ impl<'a> Lifter<'a> {
                 Flow::Next
             }
             // `|a - b|`: for floating point, a subtract and an absolute value.
+            VOp3::FAcGe | VOp3::FAcGt => {
+                let x = self.b.def(Expr::VLaneUn { op: VLaneUnOp::Abs, lane, a });
+                let y = self.b.def(Expr::VLaneUn { op: VLaneUnOp::Abs, lane, a: b });
+                let cmp = if op == VOp3::FAcGe { VLaneBinOp::GeS } else { VLaneBinOp::GtS };
+                let r = self.b.def(Expr::VLaneBin { op: cmp, lane, a: x, b: y });
+                self.commit_vector(vd, arr, r);
+                Flow::Next
+            }
             VOp3::FAbd => {
                 let diff = self.b.def(Expr::VLaneBin {
                     op: VLaneBinOp::Sub,
@@ -2993,6 +3012,8 @@ impl<'a> Lifter<'a> {
             // Pairwise: deinterleave the concatenation, then combine.
             VOp3::AddP
             | VOp3::FAddP
+            | VOp3::FMaxP
+            | VOp3::FMinP
             | VOp3::SMaxP
             | VOp3::UMaxP
             | VOp3::SMinP
@@ -3009,9 +3030,10 @@ impl<'a> Lifter<'a> {
                     lanes: Box::new(odds),
                 });
                 let pair = match op {
-                    VOp3::SMaxP => VLaneBinOp::MaxS,
+                    // On float lanes these are wasm's f32x4.max/min, as `FMax` above.
+                    VOp3::SMaxP | VOp3::FMaxP => VLaneBinOp::MaxS,
                     VOp3::UMaxP => VLaneBinOp::MaxU,
-                    VOp3::SMinP => VLaneBinOp::MinS,
+                    VOp3::SMinP | VOp3::FMinP => VLaneBinOp::MinS,
                     VOp3::UMinP => VLaneBinOp::MinU,
                     _ => VLaneBinOp::Add,
                 };
@@ -4286,6 +4308,77 @@ impl<'a> Lifter<'a> {
     }
 
     /// Read a scalar float out of a `v` register as its bit pattern.
+    /// `vd = (+/-a) * b + (+/-c)`, with one rounding. AArch64 fuses this; wasm has no FMA, and
+    /// rounding the product first is enough to break musl's `pow`, which is built on it. So the
+    /// host's FMA is called.
+    #[allow(clippy::too_many_arguments)]
+    fn fused(&mut self, vd: gex_isa::VReg, sz: FpSz, a: Value, b: Value, c: Value, neg_product: bool, neg_addend: bool) -> Flow {
+        let double = sz.is_double();
+        let a = if neg_product {
+            self.b.def(Expr::FpUn {
+                op: FpUnOp::Neg,
+                double,
+                a,
+            })
+        } else {
+            a
+        };
+        let c = if neg_addend {
+            self.b.def(Expr::FpUn {
+                op: FpUnOp::Neg,
+                double,
+                a: c,
+            })
+        } else {
+            c
+        };
+        // GEX_INLINE_FMA emits a multiply and an add instead. Not
+        // correct -- it rounds twice -- and exists only to measure
+        // what the fused host call costs.
+        if inline_fma() {
+            let prod = self.b.def(Expr::FpBin {
+                op: FpBinOp::Mul,
+                double,
+                a,
+                b,
+            });
+            let v = self.b.def(Expr::FpBin {
+                op: FpBinOp::Add,
+                double,
+                a: prod,
+                b: c,
+            });
+            self.wr_fp(vd, sz, v);
+            return Flow::Next;
+        }
+        let (a64, b64, c64) = if double {
+            (a, b, c)
+        } else {
+            // The import speaks in 64-bit words; a single-precision
+            // pattern rides in the low half.
+            (
+                self.b.def(Expr::Extend { a, signed: false }),
+                self.b.def(Expr::Extend {
+                    a: b,
+                    signed: false,
+                }),
+                self.b.def(Expr::Extend {
+                    a: c,
+                    signed: false,
+                }),
+            )
+        };
+        let is_double = self.konst(Ty::I32, double as u64);
+        let r = self.b.def(Expr::HostCall {
+            func: HostFunc::Fma,
+            args: vec![a64, b64, c64, is_double],
+            ty: Ty::I64,
+        });
+        let v = if double { r } else { self.b.def(Expr::Wrap(r)) };
+        self.wr_fp(vd, sz, v);
+        Flow::Next
+    }
+
     fn rd_fp(&mut self, v: gex_isa::VReg, sz: FpSz) -> Value {
         let vec = self.b.read(GuestReg::V128(v.0));
         self.b.def(Expr::VExtract {

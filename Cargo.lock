@@ -572,6 +572,7 @@ dependencies = [
  "gex-dylink",
  "gex-emit",
  "gex-ir",
+ "gex-isa",
  "gex-kernel",
  "gex-key",
  "gex-ld",

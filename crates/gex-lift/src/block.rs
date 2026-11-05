@@ -247,6 +247,41 @@ mod tests {
         out.regs
     }
 
+    /// `uaddlv h0, v0.8b` lifts (it raised SIGILL).
+    #[test]
+    fn add_long_across_lanes_lifts() {
+        let code = vec![0x2e303800_u32, 0xd65f03c0];
+        let base = 0x1000u64;
+        let block = lift_block(words(base, &code), base, BlockLimits::default());
+        assert!(!matches!(block.term, Term::Illegal { .. }), "uaddlv lifted as illegal");
+    }
+
+    /// One word of each kind that had no lowering goes on to the next
+    /// instruction: lowered, or as a call to the host.
+    #[test]
+    fn surveyed_words_lift() {
+        for raw in [
+            0x4f80d021_u32, 0x0ea00c20, 0x0e60b484, 0x5f809020, 0x0f0e9c5c, 0x5f801822, 0x4f0e9cdc, 0x4e284801,
+            0x2e20f400, 0x4e286800, 0x5e280820, 0x4e287800, 0x4e285801, 0x5e063128, 0x5e2818c7, 0x5e0442b6,
+            0x5e045255, 0x5f805844, 0x5e006061, 0x5e282803, 0x2ea0f400, 0x5e021014, 0x0f0b961c, 0x5e020014,
+            0x5e022014, 0x0e609062, 0x4ea05c21, 0x0ea12c42, 0x0ee1e000, 0x4ee1e000, 0x4f287400, 0x1e23c000,
+            0x4f0b969c, 0x6f186695, 0x4ea154a3, 0x2ea5ee91, 0x0ea02842, 0x6ef8f802, 0x4f403041, 0x5f119f5a,
+            0x5ea10c00, 0x5ea12c00,
+        ] {
+            let code = vec![raw, 0xd65f03c0];
+            let base = 0x1000u64;
+            let block = lift_block(words(base, &code), base, BlockLimits::default());
+            assert!(!matches!(block.term, Term::Illegal { .. }), "{raw:08x} lifted as illegal");
+        }
+    }
+
+    /// `udf` and data stay refusals: only understood words reach the host.
+    #[test]
+    fn what_nothing_understands_stays_illegal() {
+        let block = lift_block(words(0x1000, &[0, 0xd65f03c0]), 0x1000, BlockLimits::default());
+        assert!(matches!(block.term, Term::Illegal { raw: 0, .. }));
+    }
+
     /// The CRC32 / CRC32C expansion: known-answer vectors ("123456789") and
     /// a plain reference bit loop over a few inputs.
     #[test]

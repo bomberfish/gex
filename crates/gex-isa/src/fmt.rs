@@ -1055,6 +1055,8 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
             // rather than `-v`, and their source is still a two-lane vector.
             let m = match (op, arr.scalar) {
                 (VAcrossOp::Add, false) => "addv",
+                (VAcrossOp::SAddLv, _) => "saddlv",
+                (VAcrossOp::UAddLv, _) => "uaddlv",
                 (VAcrossOp::Add, true) if arr.float => "faddp",
                 (VAcrossOp::Add, true) => "addp",
                 (VAcrossOp::SMax, _) => "smaxv",
@@ -1766,6 +1768,10 @@ fn vop3_name(op: VOp3) -> &'static str {
         VOp3::FMaxNm => "fmaxnm",
         VOp3::FMinNm => "fminnm",
         VOp3::FAddP => "faddp",
+        VOp3::FMaxP => "fmaxp",
+        VOp3::FMinP => "fminp",
+        VOp3::FAcGe => "facge",
+        VOp3::FAcGt => "facgt",
         VOp3::FMla => "fmla",
         VOp3::FMls => "fmls",
         VOp3::FCmEq => "fcmeq",
