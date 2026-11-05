@@ -98,14 +98,21 @@ fn f32_to_f16(v: f32) -> u16 {
 }
 
 fn f64_to_f16(v: f64) -> u16 {
-    // Through single would round twice: keep what a double holds below single's bits sticky.
-    let b = v.to_bits();
-    let exact = v as f32;
-    if (exact as f64).to_bits() == b || v.is_nan() || v.is_infinite() {
-        return f32_to_f16(exact);
+    // Through single would round twice. Single rounded to odd instead -- truncated toward zero,
+    // its last bit set when anything was cut off -- keeps what a double holds below single's
+    // bits sticky, and single has the 2 * 11 + 2 bits that makes half's one rounding of it exact.
+    // (`as f32` rounds to nearest, which can go up past `v`: hence the step back first.)
+    if v.is_nan() || v.is_infinite() {
+        return f32_to_f16(v as f32);
     }
-    let sticky = f32::from_bits(exact.to_bits() | 1);
-    f32_to_f16(if (exact.to_bits() & 1) == 0 { sticky } else { exact })
+    let mut t = v as f32;
+    if (t as f64).abs() > v.abs() {
+        t = f32::from_bits(t.to_bits() - 1);
+    }
+    if t as f64 != v {
+        t = f32::from_bits(t.to_bits() | 1);
+    }
+    f32_to_f16(t)
 }
 
 fn f16_to_f64(h: u16) -> f64 {
@@ -945,6 +952,26 @@ mod tests {
         regs[0] = 0x3c00;
         run(0x6ef8f802, &mut regs);
         assert_eq!(lane(regs[2], 0, 2), 0xbc00);
+    }
+
+    /// `fcvt h0, d0` rounds once: a double just below the halfway point between two halves
+    /// rounds down, though single's nearest value to it *is* the halfway point.
+    #[test]
+    fn double_to_half_rounds_once() {
+        let mut regs = zeroed();
+        let fcvt_h0_d0 = 0x1e63c000;
+        for (v, want) in [
+            (1.0 + 2f64.powi(-11) - 2f64.powi(-40), 0x3c00), // below halfway: down
+            (1.0 + 2f64.powi(-11) + 2f64.powi(-40), 0x3c01), // above: up
+            (1.0 + 2f64.powi(-11), 0x3c00),                  // the tie: to even
+            (-(1.0 + 3.0 * 2f64.powi(-11) - 2f64.powi(-40)), 0xbc01),
+            (1.0e300, 0x7c00),
+            (1.0e-300, 0x0000),
+        ] {
+            regs[0] = f64::to_bits(v) as u128;
+            run(fcvt_h0_d0, &mut regs);
+            assert_eq!(regs[0], want, "fcvt h, d of {v:e}");
+        }
     }
 
     #[test]
