@@ -1204,38 +1204,104 @@ impl<'a> Lifter<'a> {
             }
 
             Inst::CompareSwapPair { sz, rs, rt, rn, .. } => {
-                // A pair CAS as two single-element cmpxchg: exact while the
-                // world is single-threaded (nothing can change the second
-                // element between the two), and what a threaded world must
-                // replace with a real 128-bit atomic or a lock. The compare
-                // pair Rs:Rs+1 receives the pair read from memory; the swap
-                // pair Rt:Rt+1 is written on a match.
-                let ty = if sz == MemSz::D { Ty::I64 } else { Ty::I32 };
-                let width = if sz == MemSz::D { Sz::X } else { Sz::W };
+                // The compare pair Rs:Rs+1 receives the pair read from memory;
+                // the swap pair Rt:Rt+1 is written when *both* elements match,
+                // and neither is written otherwise. All four registers are
+                // read before either compare register is written.
                 let addr = self.rd_addr(rn);
-                let step = sz.bytes() as i64;
-                for i in 0..2 {
-                    let rsi = pair_next(rs, i);
-                    let rti = pair_next(rt, i);
-                    let elem = if i == 0 {
-                        addr
-                    } else {
-                        let off = self.b.const_i64(step as u64);
-                        self.b.bin(BinOp::Add, Ty::I64, addr, off)
+                let (rs1, rt1) = (pair_next(rs, 1), pair_next(rt, 1));
+                if sz != MemSz::D {
+                    // A pair of words is one aligned doubleword (CASP requires
+                    // the pair's alignment): one 64-bit cmpxchg, exact, the
+                    // first element in the low half.
+                    let pack = |l: &mut Self, lo: RegSel, hi: RegSel| {
+                        let lo = l.rd_gp(lo, Sz::W);
+                        let hi = l.rd_gp(hi, Sz::W);
+                        let lo = l.b.extend(lo, false);
+                        let hi = l.b.extend(hi, false);
+                        let k = l.konst(Ty::I64, 32);
+                        let hi = l.b.bin(BinOp::Shl, Ty::I64, hi, k);
+                        l.b.bin(BinOp::Or, Ty::I64, lo, hi)
                     };
-                    let expected = self.rd_gp(rsi, width);
-                    let replacement = self.rd_gp(rti, width);
+                    let expected = pack(self, rs, rs1);
+                    let replacement = pack(self, rt, rt1);
                     let old = self.b.def(Expr::CmpXchg {
-                        addr: elem,
+                        addr,
                         expected,
                         replacement,
-                        sz: mem_sz(sz),
-                        ty,
+                        sz: gex_ir::MemSz::B8,
+                        ty: Ty::I64,
                     });
-                    // Like CAS, each half writes what was read back into
-                    // its compare register.
-                    self.wr_gp(rsi, width, old);
+                    let lo = self.b.wrap(old);
+                    let k = self.konst(Ty::I64, 32);
+                    let hi = self.b.bin(BinOp::ShrU, Ty::I64, old, k);
+                    let hi = self.b.wrap(hi);
+                    self.wr_gp(rs, Sz::W, lo);
+                    self.wr_gp(rs1, Sz::W, hi);
+                    return Flow::Next;
                 }
+                // A pair of doublewords: wasm has no 128-bit atomic, so the
+                // pair is checked whole first and then swapped one element at
+                // a time, the first undone if the second no longer matches.
+                // With one thread this is exact (no half-written pair, ever);
+                // with several, another thread can still see the first
+                // element swapped for the instant before the second's
+                // cmpxchg, or change the pair between the check and the swap
+                // -- what only a real 128-bit atomic would close.
+                let e0 = self.rd_gp(rs, Sz::X);
+                let e1 = self.rd_gp(rs1, Sz::X);
+                let n0 = self.rd_gp(rt, Sz::X);
+                let n1 = self.rd_gp(rt1, Sz::X);
+                let eight = self.konst(Ty::I64, 8);
+                let a1 = self.b.bin(BinOp::Add, Ty::I64, addr, eight);
+                let load = |l: &mut Self, a: Value| {
+                    l.b.def(Expr::Load {
+                        addr: a,
+                        offset: 0,
+                        sz: gex_ir::MemSz::B8,
+                        signed: false,
+                        ty: Ty::I64,
+                        order: Order::SeqCst,
+                    })
+                };
+                let cas = |l: &mut Self, a: Value, expected: Value, replacement: Value| {
+                    l.b.def(Expr::CmpXchg {
+                        addr: a,
+                        expected,
+                        replacement,
+                        sz: gex_ir::MemSz::B8,
+                        ty: Ty::I64,
+                    })
+                };
+                let l0 = load(self, addr);
+                let l1 = load(self, a1);
+                let m0 = self.b.cmp(CmpOp::Eq, Ty::I64, l0, e0);
+                let m1 = self.b.cmp(CmpOp::Eq, Ty::I64, l1, e1);
+                let matched = self.b.bin(BinOp::And, Ty::I32, m0, m1);
+                // Element 0: swapped only when the whole pair matched (else
+                // a cmpxchg of the expected value with itself, which never
+                // changes memory).
+                let r0_new = self.b.select(matched, n0, e0, Ty::I64);
+                let r0 = cas(self, addr, e0, r0_new);
+                let same0 = self.b.cmp(CmpOp::Eq, Ty::I64, r0, e0);
+                let ok0 = self.b.bin(BinOp::And, Ty::I32, matched, same0);
+                // Element 1: swapped only when element 0 was.
+                let r1_new = self.b.select(ok0, n1, e1, Ty::I64);
+                let r1 = cas(self, a1, e1, r1_new);
+                let differ1 = self.b.cmp(CmpOp::Ne, Ty::I64, r1, e1);
+                // Element 0 swapped but element 1 did not: put element 0
+                // back (else, again, a cmpxchg that cannot change memory).
+                let undo = self.b.bin(BinOp::And, Ty::I32, ok0, differ1);
+                let back = self.b.select(undo, e0, n0, Ty::I64);
+                cas(self, addr, n0, back);
+                // What the guest compares: the pair the decision was made
+                // on. A failed check returns the loads (one of which differs
+                // from Rs:Rs+1); after it, the cmpxchgs' reads (both equal to
+                // Rs:Rs+1 exactly when the pair was swapped).
+                let out0 = self.b.select(matched, r0, l0, Ty::I64);
+                let out1 = self.b.select(matched, r1, l1, Ty::I64);
+                self.wr_gp(rs, Sz::X, out0);
+                self.wr_gp(rs1, Sz::X, out1);
                 Flow::Next
             }
 

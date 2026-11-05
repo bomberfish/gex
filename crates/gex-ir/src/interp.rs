@@ -230,6 +230,36 @@ pub fn run_with_memory(f: &Function, seed: u64, mut regs: Vec<u64>, m: &Model, i
                             }
                             x & ty.mask()
                         }
+                        // One thread: read, and write the replacement when the
+                        // value read equals the expected one, both taken to the
+                        // access size (wasm's `atomic.rmw.cmpxchg`).
+                        Expr::CmpXchg {
+                            addr,
+                            expected,
+                            replacement,
+                            sz,
+                            ty,
+                        } => {
+                            let (Some(a), Some(e), Some(r)) =
+                                (get(&vals, *addr), get(&vals, *expected), get(&vals, *replacement))
+                            else {
+                                finish!(unsupported());
+                            };
+                            let n = sz.bytes();
+                            let mask = if n == 8 { u64::MAX } else { (1u64 << (8 * n)) - 1 };
+                            let mut x = 0u64;
+                            for i in 0..n {
+                                x |= (read_byte(&mem, a.wrapping_add(i as u64)) as u64) << (8 * i);
+                            }
+                            if x == e & mask {
+                                for i in 0..n {
+                                    let byte = (r >> (8 * i)) as u8;
+                                    mem.insert(a.wrapping_add(i as u64), byte);
+                                    written.insert(a.wrapping_add(i as u64), byte);
+                                }
+                            }
+                            x & ty.mask()
+                        }
                         e if e.ty() != Ty::V128
                             && !matches!(
                                 e,

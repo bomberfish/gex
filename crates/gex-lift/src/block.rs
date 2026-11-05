@@ -208,6 +208,16 @@ mod tests {
     /// reference interpreter, starting from `regs` (indexed by
     /// [`reg_index`]); returns the run's register file.
     fn run_block(b: &gex_ir::Block, regs: Vec<u64>) -> Vec<u64> {
+        run_block_on(b, regs, &std::collections::HashMap::new()).regs
+    }
+
+    /// [`run_block`] on a memory that starts with `init`, returning the whole
+    /// outcome (registers and the bytes written).
+    fn run_block_on(
+        b: &gex_ir::Block,
+        regs: Vec<u64>,
+        init: &std::collections::HashMap<u64, u8>,
+    ) -> gex_ir::interp::Outcome {
         use gex_ir::func::{FBlock, FTerm, Form, Function};
         use gex_ir::{interp, ssa::CallEffect, GuestReg, Term};
         let f = Function {
@@ -238,13 +248,58 @@ mod tests {
             syscall: None,
             narrow: false,
         };
-        let out = interp::run_from(&f, 0, regs, &m);
+        let out = interp::run_with_memory(&f, 0, regs, &m, init);
         assert!(
             matches!(out.stop, interp::Stop::Return(_)),
             "the run stopped at {:?}",
             out.stop
         );
-        out.regs
+        out
+    }
+
+    /// `casp` swaps the pair whole or not at all, and hands back the pair it
+    /// read: both widths, with the pair matching, its first element only, and
+    /// its second only. (Two independent cmpxchgs wrote the first element of
+    /// a pair whose second did not match.)
+    #[test]
+    fn compare_swap_pair_is_all_or_nothing() {
+        use gex_ir::func::reg_index;
+        use gex_ir::{interp, GuestReg};
+        use std::collections::HashMap;
+        const AT: u64 = 0x10_0000;
+        // casp x2, x3, x4, x5, [x1] and caspal w2, w3, w4, w5, [x1].
+        for (word, bytes) in [(0x48227c24u32, 8u32), (0x0862fc24, 4)] {
+            let mask = if bytes == 8 { u64::MAX } else { 0xffff_ffff };
+            let (m0, m1) = (0x1111_2222_3333_4444 & mask, 0x5555_6666_7777_8888 & mask);
+            let (n0, n1) = (0x9999_aaaa_bbbb_cccc & mask, 0xdddd_eeee_ffff_0001 & mask);
+            for (e0, e1, swaps) in [(m0, m1, true), (m0, m1 ^ 1, false), (m0 ^ 1, m1, false)] {
+                let b = lift_block(words(0x6000, &[word, 0xd65f03c0]), 0x6000, BlockLimits::default());
+                let mut init = HashMap::new();
+                for i in 0..bytes as u64 {
+                    init.insert(AT + i, (m0 >> (8 * i)) as u8);
+                    init.insert(AT + bytes as u64 + i, (m1 >> (8 * i)) as u8);
+                }
+                let mut regs = interp::initial_regs(0, GuestReg::Sp);
+                regs[reg_index(GuestReg::X(1))] = AT;
+                regs[reg_index(GuestReg::X(2))] = e0;
+                regs[reg_index(GuestReg::X(3))] = e1;
+                regs[reg_index(GuestReg::X(4))] = n0;
+                regs[reg_index(GuestReg::X(5))] = n1;
+                let out = run_block_on(&b, regs, &init);
+                let mut mem = init.clone();
+                mem.extend(out.memory.iter().map(|(&a, &v)| (a, v)));
+                let elem = |k: u64| {
+                    (0..bytes as u64).fold(0u64, |x, i| x | (mem[&(AT + k * bytes as u64 + i)] as u64) << (8 * i))
+                };
+                let want = if swaps { (n0, n1) } else { (m0, m1) };
+                assert_eq!((elem(0), elem(1)), want, "{word:#010x}, expecting ({e0:#x}, {e1:#x})");
+                assert_eq!(
+                    (out.regs[reg_index(GuestReg::X(2))], out.regs[reg_index(GuestReg::X(3))]),
+                    (m0, m1),
+                    "{word:#010x}: the compare pair receives what memory held"
+                );
+            }
+        }
     }
 
     /// `uaddlv h0, v0.8b` lifts (it raised SIGILL).
