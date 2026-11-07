@@ -3798,6 +3798,72 @@ impl<'a> Lifter<'a> {
                 self.commit_vector(vd, arr, r);
                 return Flow::Next;
             }
+            // Saturating shifts left. A lane fits when shifting the result
+            // back gives the lane again (arithmetically for `sqshl`,
+            // logically for the unsigned forms); one that does not takes the
+            // limit on its side: all-ones for the unsigned forms, and for
+            // `sqshl` the signed maximum, or the minimum for a negative lane
+            // (`MAX ^ (a >> (bits-1))`). `sqshlu` clamps negative lanes to
+            // zero, and a lane that is not negative saturates as `uqshl`'s.
+            // FPSR.QC is not kept: it reads back as zero, as for the other
+            // saturating lowerings.
+            VShiftImmOp::SqShl | VShiftImmOp::UqShl | VShiftImmOp::SqShlU => {
+                let signed = op == VShiftImmOp::SqShl;
+                let shifted = self.b.def(Expr::VShift {
+                    op: VShiftOp::Shl,
+                    lane,
+                    a,
+                    amount,
+                });
+                let back = self.b.def(Expr::VShift {
+                    op: if signed { VShiftOp::ShrS } else { VShiftOp::ShrU },
+                    lane,
+                    a: shifted,
+                    amount,
+                });
+                let fits = self.b.def(Expr::VLaneBin {
+                    op: VLaneBinOp::Eq,
+                    lane,
+                    a: back,
+                    b: a,
+                });
+                let top = self.b.const_i32(bits - 1);
+                let sign = self.b.def(Expr::VShift {
+                    op: VShiftOp::ShrS,
+                    lane,
+                    a,
+                    amount: top,
+                });
+                let limit = if signed {
+                    let mut max = [0xffu8; 16];
+                    let width = arr.lane_bytes as usize;
+                    for l in 0..16 / width {
+                        max[l * width + width - 1] = 0x7f;
+                    }
+                    let max = self.b.def(Expr::VConst(Box::new(max)));
+                    self.b.def(Expr::VBin {
+                        op: VBinOp::Xor,
+                        a: max,
+                        b: sign,
+                    })
+                } else {
+                    self.b.def(Expr::VConst(Box::new([0xffu8; 16])))
+                };
+                let mut r = self.b.def(Expr::VBitSelect {
+                    mask: fits,
+                    a: shifted,
+                    b: limit,
+                });
+                if op == VShiftImmOp::SqShlU {
+                    r = self.b.def(Expr::VBin {
+                        op: VBinOp::AndNot,
+                        a: r,
+                        b: sign,
+                    });
+                }
+                self.commit_vector(vd, arr, r);
+                return Flow::Next;
+            }
             // Shift right, then add to what the destination already holds.
             VShiftImmOp::SSra | VShiftImmOp::USra => {
                 let signed = op == VShiftImmOp::SSra;

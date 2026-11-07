@@ -330,6 +330,146 @@ mod tests {
         }
     }
 
+    /// The vector values of a lifted block, evaluated plainly (gex-ir's
+    /// interpreter leaves V128 alone): only the expressions the saturating
+    /// shifts lower to. Returns the V128 registers the block writes.
+    fn eval_vectors(b: &gex_ir::Block, v: &[u128; 32]) -> std::collections::HashMap<u8, u128> {
+        use gex_ir::{Expr, VBinOp, VLane, VLaneBinOp, VShiftOp};
+        let mut val = std::collections::HashMap::<u32, u128>::new();
+        let mut out = std::collections::HashMap::new();
+        let w = |lane: VLane| match lane {
+            VLane::I8 => 8u32,
+            VLane::I16 => 16,
+            VLane::I32 => 32,
+            VLane::I64 => 64,
+            l => panic!("{l:?} lanes"),
+        };
+        let lanes = |x: u128, bits: u32, f: &dyn Fn(u64) -> u64| -> u128 {
+            let m = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+            let mut r = 0u128;
+            for i in 0..128 / bits {
+                let l = (x >> (i * bits)) as u64 & m;
+                r |= ((f(l) & m) as u128) << (i * bits);
+            }
+            r
+        };
+        for st in &b.stmts {
+            match st {
+                Stmt::Def { dst, expr } => {
+                    let g = |x: &gex_ir::Value| val[&x.0];
+                    let r = match expr {
+                        Expr::ReadReg(GuestReg::V128(n)) => v[*n as usize],
+                        Expr::VConst(c) => u128::from_le_bytes(**c),
+                        Expr::ConstI32(c) => *c as u128,
+                        Expr::VShift { op, lane, a, amount } => {
+                            let bits = w(*lane);
+                            let n = g(amount) as u32 % bits;
+                            let sx = |l: u64| ((l << (64 - bits)) as i64 >> (64 - bits)) as u64;
+                            lanes(g(a), bits, &|l| match op {
+                                VShiftOp::Shl => l << n,
+                                VShiftOp::ShrU => l >> n,
+                                VShiftOp::ShrS => (sx(l) as i64 >> n) as u64,
+                            })
+                        }
+                        Expr::VLaneBin { op: VLaneBinOp::Eq, lane, a, b } => {
+                            let bits = w(*lane);
+                            let (x, y) = (g(a), g(b));
+                            let m = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+                            let mut r = 0u128;
+                            for i in 0..128 / bits {
+                                if (x >> (i * bits)) as u64 & m == (y >> (i * bits)) as u64 & m {
+                                    r |= (m as u128) << (i * bits);
+                                }
+                            }
+                            r
+                        }
+                        Expr::VBin { op, a, b } => match op {
+                            VBinOp::And => g(a) & g(b),
+                            VBinOp::Or => g(a) | g(b),
+                            VBinOp::Xor => g(a) ^ g(b),
+                            VBinOp::AndNot => g(a) & !g(b),
+                        },
+                        Expr::VBitSelect { mask, a, b } => (g(a) & g(mask)) | (g(b) & !g(mask)),
+                        e => panic!("not evaluated here: {e:?}"),
+                    };
+                    val.insert(dst.0, r);
+                }
+                Stmt::WriteReg { reg: GuestReg::V128(n), val: x } => {
+                    out.insert(*n, val[&x.0]);
+                }
+                Stmt::WriteReg { .. } => {}
+                s => panic!("not evaluated here: {s:?}"),
+            }
+        }
+        out
+    }
+
+    /// `sqshl`, `uqshl` and `sqshlu` by immediate, every lane width, both
+    /// vector sizes and the scalar forms, against the instructions' reference
+    /// semantics (`gex_isa::slow`) on edge and pseudo-random lanes.
+    #[test]
+    fn saturating_shifts_left_by_immediate_match_the_reference() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let reference = |raw: u32, v: &[u128; 32]| -> u128 {
+            let mut bytes = [0u8; 512];
+            for (i, r) in v.iter().enumerate() {
+                bytes[i * 16..i * 16 + 16].copy_from_slice(&r.to_le_bytes());
+            }
+            let mut fpsr = 0;
+            assert!(gex_isa::slow::execute(raw, &mut gex_isa::slow::VRegs(&mut bytes), &mut fpsr));
+            u128::from_le_bytes(bytes[16..32].try_into().unwrap())
+        };
+        for (u, opcode) in [(0u32, 0b01110u32), (1, 0b01110), (1, 0b01100)] {
+            for esize in [8u32, 16, 32, 64] {
+                for shift in 0..esize {
+                    for (q, scalar) in [(false, false), (true, false), (true, true)] {
+                        // There is no `.1d` vector form.
+                        if esize == 64 && !q {
+                            continue;
+                        }
+                        // sqshl v1, v2, #shift (or its scalar form): 0 Q U 011110 immh:immb opcode 1 Rn Rd
+                        let fields = (u << 29) | ((esize + shift) << 16) | (opcode << 11) | (1 << 10) | (2 << 5) | 1;
+                        let raw = if scalar {
+                            (1 << 30) | (0b111110 << 23) | fields
+                        } else {
+                            ((q as u32) << 30) | (0b011110 << 23) | fields
+                        };
+                        let block = lift_block(words(0x1000, &[raw]), 0x1000, BlockLimits { max_insts: 1 });
+                        assert!(!matches!(block.term, Term::Illegal { .. }), "{raw:08x} lifted as illegal");
+                        for round in 0..24 {
+                            let mut v = [0u128; 32];
+                            v[1] = (rnd() as u128) << 64 | rnd() as u128;
+                            let mut x = 0u128;
+                            for i in 0..128 / esize {
+                                let m = if esize == 64 { u64::MAX } else { (1u64 << esize) - 1 };
+                                // Edges first: zero, one, all-ones, the signed limits and the
+                                // values on either side of where the shift saturates.
+                                let edge = [0u64, 1, m, m >> 1, (m >> 1) + 1, (m >> 1) >> shift, ((m >> 1) >> shift) + 1, !((m >> 1) >> shift)];
+                                let l = if round < 4 { edge[(i as usize + 2 * round) % edge.len()] } else { rnd() >> (rnd() % 64) };
+                                x |= ((l & m) as u128) << (i * esize);
+                            }
+                            v[2] = x;
+                            // The reference runs the vector form; a scalar form is its lowest lane.
+                            let vraw = if scalar { (raw & !(0b111110 << 23) & !(1 << 28)) | (0b011110 << 23) | (1 << 30) } else { raw };
+                            let mut want = reference(vraw, &v);
+                            if scalar {
+                                want &= if esize == 64 { u64::MAX as u128 } else { (1u128 << esize) - 1 };
+                            }
+                            let got = eval_vectors(&block, &v)[&1];
+                            assert_eq!(got, want, "{} {raw:08x} on {x:032x}", gex_isa::fmt::disasm(&decode::decode(raw, 0x1000), 0x1000));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// `udf` and data stay refusals: only understood words reach the host.
     #[test]
     fn what_nothing_understands_stays_illegal() {

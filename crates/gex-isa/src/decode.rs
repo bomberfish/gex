@@ -1799,7 +1799,10 @@ fn scalar_form_exists(inst: &Inst) -> bool {
             VShiftImmOp::Scvtf
             | VShiftImmOp::Ucvtf
             | VShiftImmOp::Fcvtzs
-            | VShiftImmOp::Fcvtzu => true,
+            | VShiftImmOp::Fcvtzu
+            | VShiftImmOp::SqShl
+            | VShiftImmOp::UqShl
+            | VShiftImmOp::SqShlU => true,
             VShiftImmOp::SShll | VShiftImmOp::UShll | VShiftImmOp::Shrn | VShiftImmOp::Rshrn => {
                 false
             }
@@ -2439,6 +2442,9 @@ fn decode_simd_shift_imm(raw: u32, q: bool, u: u32, immh: u32, immb: u32) -> Ins
         (0b00110, _) => VShiftImmOp::Ursra,
         (0b01000, 1) => VShiftImmOp::Sri,
         (0b01010, 1) => VShiftImmOp::Sli,
+        (0b01110, 0) => VShiftImmOp::SqShl,
+        (0b01110, _) => VShiftImmOp::UqShl,
+        (0b01100, 1) => VShiftImmOp::SqShlU,
         // The fixed-point conversions. They are not shifts, but the scale
         // lives in the same `immh:immb` field and counts down from the
         // element width exactly as a right shift does.
@@ -2472,7 +2478,13 @@ fn decode_simd_shift_imm(raw: u32, q: bool, u: u32, immh: u32, immb: u32) -> Ins
     // Left shifts count up from the element size; right shifts count down.
     let left = matches!(
         op,
-        VShiftImmOp::Shl | VShiftImmOp::SShll | VShiftImmOp::UShll | VShiftImmOp::Sli
+        VShiftImmOp::Shl
+            | VShiftImmOp::SShll
+            | VShiftImmOp::UShll
+            | VShiftImmOp::Sli
+            | VShiftImmOp::SqShl
+            | VShiftImmOp::UqShl
+            | VShiftImmOp::SqShlU
     );
     let shift = if left {
         imm.wrapping_sub(esize)

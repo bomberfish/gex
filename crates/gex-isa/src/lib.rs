@@ -1447,6 +1447,12 @@ pub enum VShiftImmOp {
     /// than being zero, so the shift is a splice of the two registers.
     Sli,
     Sri,
+    /// Saturating shift left: `sqshl` and `uqshl` clamp a lane whose bits
+    /// would leave it to the lane's signed or unsigned limit; `sqshlu` reads
+    /// a signed lane and clamps to the unsigned range (negative lanes are 0).
+    SqShl,
+    UqShl,
+    SqShlU,
     /// Fixed-point to floating point: the lane is an integer with `shift`
     /// fractional bits, so the result is it divided by `2^shift`. Shares the
     /// shift-by-immediate encoding because the scale sits in the same field.
