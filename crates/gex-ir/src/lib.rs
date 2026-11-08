@@ -699,6 +699,14 @@ pub enum VLaneBinOp {
     SubSatS,
     SubSatU,
     AvgrU,
+    /// `i16x8.q15mulr_sat_s`: `(a * b + 0x4000) >> 15` per lane, saturated; the only
+    /// overflow is `-32768 * -32768`. AArch64's `sqrdmulh` on halfwords, exactly.
+    Q15MulrSatS,
+    /// Signed widening multiply of the low (or high) half of the source lanes: the
+    /// result has half as many lanes, each twice as wide as `lane`, which names the
+    /// *source* lanes (`i32x4.extmul_low_i16x8_s`, `i64x2.extmul_low_i32x4_s`).
+    ExtMulLowS,
+    ExtMulHighS,
     Eq,
     Ne,
     LtS,
@@ -1545,6 +1553,13 @@ impl VLaneBinOp {
             (SubSatU, I16) => 0x93,
             (AvgrU, I8) => 0x7b,
             (AvgrU, I16) => 0x9b,
+            (Q15MulrSatS, I16) => 0x82,
+            (ExtMulLowS, I8) => 0x9c,
+            (ExtMulHighS, I8) => 0x9d,
+            (ExtMulLowS, I16) => 0xbc,
+            (ExtMulHighS, I16) => 0xbd,
+            (ExtMulLowS, I32) => 0xdc,
+            (ExtMulHighS, I32) => 0xdd,
             (Eq, I8) => 0x23,
             (Eq, I16) => 0x2d,
             (Eq, I32) => 0x37,

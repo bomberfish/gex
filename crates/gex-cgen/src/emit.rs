@@ -2041,6 +2041,16 @@ pub(crate) fn lane_bin(op: VLaneBinOp, lane: VLane) -> Result<String> {
     if op.wasm_opcode(lane).is_none() {
         bail!("no wasm SIMD instruction for {op:?} on {lane:?}");
     }
+    // The widening multiplies are named for their result and their source.
+    if let ExtMulLowS | ExtMulHighS = op {
+        let (to, from) = match lane {
+            VLane::I8 => ("i16x8", "i8x16"),
+            VLane::I16 => ("i32x4", "i16x8"),
+            _ => ("i64x2", "i32x4"),
+        };
+        let half = if op == ExtMulLowS { "low" } else { "high" };
+        return Ok(format!("wasm_{to}_extmul_{half}_{from}"));
+    }
     let unsigned = matches!(
         op,
         MinU | MaxU | AddSatU | SubSatU | AvgrU | LtU | GtU | LeU | GeU
@@ -2055,6 +2065,8 @@ pub(crate) fn lane_bin(op: VLaneBinOp, lane: VLane) -> Result<String> {
         AddSatS | AddSatU => "add_sat",
         SubSatS | SubSatU => "sub_sat",
         AvgrU => "avgr",
+        Q15MulrSatS => "q15mulr_sat",
+        ExtMulLowS | ExtMulHighS => unreachable!("named above"),
         Eq => "eq",
         Ne => "ne",
         LtS | LtU => "lt",

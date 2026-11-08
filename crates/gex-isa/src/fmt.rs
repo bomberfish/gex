@@ -1302,6 +1302,12 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
                 VShiftImmOp::SqShlU => "sqshlu",
                 VShiftImmOp::Shrn => "shrn",
                 VShiftImmOp::Rshrn => "rshrn",
+                VShiftImmOp::SqShrn => "sqshrn",
+                VShiftImmOp::SqRshrn => "sqrshrn",
+                VShiftImmOp::UqShrn => "uqshrn",
+                VShiftImmOp::UqRshrn => "uqrshrn",
+                VShiftImmOp::SqShrun => "sqshrun",
+                VShiftImmOp::SqRshrun => "sqrshrun",
                 VShiftImmOp::Scvtf => "scvtf",
                 VShiftImmOp::Ucvtf => "ucvtf",
                 VShiftImmOp::Fcvtzs => "fcvtzs",
@@ -1340,14 +1346,35 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
                         )
                     }
                 }
-                VShiftImmOp::Shrn => format!(
-                    "{m}{} v{}.{}, v{}.{}, #{shift}",
-                    if arr.q { "2" } else { "" },
-                    vd.0,
-                    arr.suffix(),
-                    vn.0,
-                    wide.suffix()
-                ),
+                VShiftImmOp::Shrn
+                | VShiftImmOp::Rshrn
+                | VShiftImmOp::SqShrn
+                | VShiftImmOp::SqRshrn
+                | VShiftImmOp::UqShrn
+                | VShiftImmOp::UqRshrn
+                | VShiftImmOp::SqShrun
+                | VShiftImmOp::SqRshrun
+                    if !arr.scalar =>
+                {
+                    format!(
+                        "{m}{} v{}.{}, v{}.{}, #{shift}",
+                        if arr.q { "2" } else { "" },
+                        vd.0,
+                        arr.suffix(),
+                        vn.0,
+                        wide.suffix()
+                    )
+                }
+                // The scalar narrowing forms: `sqshrn s0, d1, #3`.
+                VShiftImmOp::SqShrn
+                | VShiftImmOp::SqRshrn
+                | VShiftImmOp::UqShrn
+                | VShiftImmOp::UqRshrn
+                | VShiftImmOp::SqShrun
+                | VShiftImmOp::SqRshrun => {
+                    let wide = VArr { scalar: true, ..wide };
+                    format!("{m} {}, {}, #{shift}", areg(vd, arr), areg(vn, wide))
+                }
                 _ => {
                     format!("{m} {}, {}, #{shift}", areg(vd, arr), areg(vn, arr))
                 }
@@ -1737,6 +1764,8 @@ fn vop3_name(op: VOp3) -> &'static str {
         VOp3::UqAdd => "uqadd",
         VOp3::SqSub => "sqsub",
         VOp3::UqSub => "uqsub",
+        VOp3::SqDmulh => "sqdmulh",
+        VOp3::SqRdmulh => "sqrdmulh",
         VOp3::SHAdd => "shadd",
         VOp3::UHAdd => "uhadd",
         VOp3::SrHAdd => "srhadd",

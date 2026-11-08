@@ -1744,6 +1744,7 @@ fn scalar_form_exists(inst: &Inst) -> bool {
     match *inst {
         Inst::VThreeSame { op, arr, .. } => match op {
             VOp3::SqAdd | VOp3::UqAdd | VOp3::SqSub | VOp3::UqSub => true,
+            VOp3::SqDmulh | VOp3::SqRdmulh => true,
             VOp3::CmGt
             | VOp3::CmGe
             | VOp3::CmHi
@@ -1802,7 +1803,13 @@ fn scalar_form_exists(inst: &Inst) -> bool {
             | VShiftImmOp::Fcvtzu
             | VShiftImmOp::SqShl
             | VShiftImmOp::UqShl
-            | VShiftImmOp::SqShlU => true,
+            | VShiftImmOp::SqShlU
+            | VShiftImmOp::SqShrn
+            | VShiftImmOp::SqRshrn
+            | VShiftImmOp::UqShrn
+            | VShiftImmOp::UqRshrn
+            | VShiftImmOp::SqShrun
+            | VShiftImmOp::SqRshrun => true,
             VShiftImmOp::SShll | VShiftImmOp::UShll | VShiftImmOp::Shrn | VShiftImmOp::Rshrn => {
                 false
             }
@@ -2141,8 +2148,14 @@ fn decode_simd_three_same(raw: u32, q: bool, u: u32) -> Inst {
         (0b10100, _) => VOp3::UMaxP,
         (0b10101, 0) => VOp3::SMinP,
         (0b10101, _) => VOp3::UMinP,
+        (0b10110, 0) => VOp3::SqDmulh,
+        (0b10110, _) => VOp3::SqRdmulh,
         _ => return Inst::Unknown { raw },
     };
+    // The doubling multiplies exist on halfwords and words only.
+    if matches!(op, VOp3::SqDmulh | VOp3::SqRdmulh) && !matches!(lane_bytes, 2 | 4) {
+        return Inst::Undefined { raw };
+    }
     // Doubleword lanes exist only for add, sub, the comparisons, the
     // register shifts and the saturating forms, and only in the 128-bit
     // register (the scalar decoder passes `q` set).
@@ -2434,6 +2447,12 @@ fn decode_simd_shift_imm(raw: u32, q: bool, u: u32, immh: u32, immb: u32) -> Ins
         (0b10100, _) => VShiftImmOp::UShll,
         (0b10000, 0) => VShiftImmOp::Shrn,
         (0b10001, 0) => VShiftImmOp::Rshrn,
+        (0b10010, 0) => VShiftImmOp::SqShrn,
+        (0b10011, 0) => VShiftImmOp::SqRshrn,
+        (0b10010, _) => VShiftImmOp::UqShrn,
+        (0b10011, _) => VShiftImmOp::UqRshrn,
+        (0b10000, _) => VShiftImmOp::SqShrun,
+        (0b10001, _) => VShiftImmOp::SqRshrun,
         (0b00010, 0) => VShiftImmOp::SSra,
         (0b00010, _) => VShiftImmOp::USra,
         (0b00100, 0) => VShiftImmOp::Srshr,
@@ -2470,7 +2489,16 @@ fn decode_simd_shift_imm(raw: u32, q: bool, u: u32, immh: u32, immb: u32) -> Ins
         && (!q
             || matches!(
                 op,
-                VShiftImmOp::SShll | VShiftImmOp::UShll | VShiftImmOp::Shrn | VShiftImmOp::Rshrn
+                VShiftImmOp::SShll
+                    | VShiftImmOp::UShll
+                    | VShiftImmOp::Shrn
+                    | VShiftImmOp::Rshrn
+                    | VShiftImmOp::SqShrn
+                    | VShiftImmOp::SqRshrn
+                    | VShiftImmOp::UqShrn
+                    | VShiftImmOp::UqRshrn
+                    | VShiftImmOp::SqShrun
+                    | VShiftImmOp::SqRshrun
             ))
     {
         return Inst::Undefined { raw };
@@ -2560,6 +2588,8 @@ fn decode_simd_by_element(raw: u32, q: bool, u: u32) -> Option<Inst> {
         (0, 0b1001) => VOp3::FMul,
         (1, 0b1001) => VOp3::FMulx,
         (0, 0b1000) => VOp3::Mul,
+        (0, 0b1100) => VOp3::SqDmulh,
+        (0, 0b1101) => VOp3::SqRdmulh,
         (1, 0b0000) => VOp3::Mla,
         (1, 0b0100) => VOp3::Mls,
         _ => return None,

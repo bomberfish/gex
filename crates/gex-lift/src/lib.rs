@@ -2789,6 +2789,20 @@ impl<'a> Lifter<'a> {
         let lane = Self::lane_of(arr);
         let a = self.b.read(GuestReg::V128(vn.0));
 
+        // wasm saturates byte and halfword lanes only; wider ones are done here.
+        if matches!(op, VOp3::SqAdd | VOp3::UqAdd | VOp3::SqSub | VOp3::UqSub)
+            && matches!(lane, VLane::I32 | VLane::I64)
+        {
+            let r = self.sat_add_sub_wide(op, lane, a, b);
+            self.commit_vector(vd, arr, r);
+            return Flow::Next;
+        }
+        if matches!(op, VOp3::SqDmulh | VOp3::SqRdmulh) {
+            let r = self.sat_doubling_mulh(op == VOp3::SqRdmulh, arr, a, b);
+            self.commit_vector(vd, arr, r);
+            return Flow::Next;
+        }
+
         let simple = |op| Some(op);
         let bin: Option<VLaneBinOp> = match op {
             VOp3::Add | VOp3::FAdd => simple(VLaneBinOp::Add),
@@ -3624,90 +3638,98 @@ impl<'a> Lifter<'a> {
                 Flow::Next
             }
             VOp2::SqXtn | VOp2::UqXtn | VOp2::SqXtun => {
-                let wide = VArr {
-                    lane_bytes: arr.lane_bytes * 2,
-                    q: true,
-                    float: false,
-                    scalar: false,
-                };
-                // WebAssembly has signed->signed and unsigned->unsigned
-                // saturating narrows. SQXTUN's signed->unsigned spelling is
-                // the latter after signed-clamping negative lanes to zero.
-                let source = if op == VOp2::SqXtun && arr.lane_bytes != 4 {
-                    let zero = self.b.def(Expr::VConst(Box::new([0; 16])));
-                    self.b.def(Expr::VLaneBin {
-                        op: VLaneBinOp::MaxS,
-                        lane: Self::lane_of(wide),
-                        a,
-                        b: zero,
-                    })
-                } else if op == VOp2::UqXtn && arr.lane_bytes != 4 {
-                    // wasm's unsigned narrow reads its source as signed, so
-                    // an unsigned source is clamped to the narrow maximum
-                    // first; after that both readings agree.
-                    let max = if arr.lane_bytes == 1 { [0xff, 0] } else { [0xff, 0xff] };
-                    let mut bytes = [0u8; 16];
-                    let w = (arr.lane_bytes * 2) as usize;
-                    for l in 0..16 / w {
-                        bytes[l * w] = max[0];
-                        bytes[l * w + 1] = max[1];
-                    }
-                    let limit = self.b.def(Expr::VConst(Box::new(bytes)));
-                    self.b.def(Expr::VLaneBin {
-                        op: VLaneBinOp::MinU,
-                        lane: Self::lane_of(wide),
-                        a,
-                        b: limit,
-                    })
-                } else {
-                    a
-                };
-                let packed = if arr.lane_bytes == 4 {
-                    self.narrow_sat_i64(op, a)
-                } else {
-                    self.b.def(Expr::VCvt {
-                        op: VCvtOp::NarrowSat {
-                            signed: op == VOp2::SqXtn,
-                        },
-                        from: Self::lane_of(wide),
-                        a: source,
-                        b: Some(source),
-                    })
-                };
-                if arr.scalar {
-                    // The scalar forms write one element and zero the rest.
-                    let mut mask = [0u8; 16];
-                    mask[..arr.lane_bytes as usize].fill(0xff);
-                    let m = self.b.def(Expr::VConst(Box::new(mask)));
-                    let r = self.b.def(Expr::VBin {
-                        op: VBinOp::And,
-                        a: packed,
-                        b: m,
-                    });
-                    self.b.write(GuestReg::V128(vd.0), r);
-                    return Flow::Next;
-                }
-                if arr.q {
-                    let old = self.b.read(GuestReg::V128(vd.0));
-                    let mut merge = [0u8; 16];
-                    for i in 0..8 {
-                        merge[i] = i as u8;
-                        merge[i + 8] = (16 + i) as u8;
-                    }
-                    let r = self.b.def(Expr::VShuffle {
-                        a: old,
-                        b: packed,
-                        lanes: Box::new(merge),
-                    });
-                    self.b.write(GuestReg::V128(vd.0), r);
-                } else {
-                    let v = self.narrow_to_64(packed, false);
-                    self.b.write(GuestReg::V128(vd.0), v);
-                }
-                Flow::Next
+                self.sat_narrow(op, arr, vd, a)
             }
             _ => Flow::End(Term::Illegal { raw: self.raw, pc }),
         }
+    }
+
+    /// `sqxtn`, `uqxtn` and `sqxtun` on `a`, whose lanes are twice `arr`'s: the
+    /// saturating narrow into `vd`'s low half, its upper half for the `2` forms, or
+    /// its single element for the scalar ones. The saturating narrowing shifts
+    /// share it after their shift.
+    fn sat_narrow(&mut self, op: VOp2, arr: VArr, vd: gex_isa::VReg, a: Value) -> Flow {
+        let wide = VArr {
+            lane_bytes: arr.lane_bytes * 2,
+            q: true,
+            float: false,
+            scalar: false,
+        };
+        // WebAssembly has signed->signed and unsigned->unsigned
+        // saturating narrows. SQXTUN's signed->unsigned spelling is
+        // the latter after signed-clamping negative lanes to zero.
+        let source = if op == VOp2::SqXtun && arr.lane_bytes != 4 {
+            let zero = self.b.def(Expr::VConst(Box::new([0; 16])));
+            self.b.def(Expr::VLaneBin {
+                op: VLaneBinOp::MaxS,
+                lane: Self::lane_of(wide),
+                a,
+                b: zero,
+            })
+        } else if op == VOp2::UqXtn && arr.lane_bytes != 4 {
+            // wasm's unsigned narrow reads its source as signed, so
+            // an unsigned source is clamped to the narrow maximum
+            // first; after that both readings agree.
+            let max = if arr.lane_bytes == 1 { [0xff, 0] } else { [0xff, 0xff] };
+            let mut bytes = [0u8; 16];
+            let w = (arr.lane_bytes * 2) as usize;
+            for l in 0..16 / w {
+                bytes[l * w] = max[0];
+                bytes[l * w + 1] = max[1];
+            }
+            let limit = self.b.def(Expr::VConst(Box::new(bytes)));
+            self.b.def(Expr::VLaneBin {
+                op: VLaneBinOp::MinU,
+                lane: Self::lane_of(wide),
+                a,
+                b: limit,
+            })
+        } else {
+            a
+        };
+        let packed = if arr.lane_bytes == 4 {
+            self.narrow_sat_i64(op, a)
+        } else {
+            self.b.def(Expr::VCvt {
+                op: VCvtOp::NarrowSat {
+                    signed: op == VOp2::SqXtn,
+                },
+                from: Self::lane_of(wide),
+                a: source,
+                b: Some(source),
+            })
+        };
+        if arr.scalar {
+            // The scalar forms write one element and zero the rest.
+            let mut mask = [0u8; 16];
+            mask[..arr.lane_bytes as usize].fill(0xff);
+            let m = self.b.def(Expr::VConst(Box::new(mask)));
+            let r = self.b.def(Expr::VBin {
+                op: VBinOp::And,
+                a: packed,
+                b: m,
+            });
+            self.b.write(GuestReg::V128(vd.0), r);
+            return Flow::Next;
+        }
+        if arr.q {
+            let old = self.b.read(GuestReg::V128(vd.0));
+            let mut merge = [0u8; 16];
+            for i in 0..8 {
+                merge[i] = i as u8;
+                merge[i + 8] = (16 + i) as u8;
+            }
+            let r = self.b.def(Expr::VShuffle {
+                a: old,
+                b: packed,
+                lanes: Box::new(merge),
+            });
+            self.b.write(GuestReg::V128(vd.0), r);
+        } else {
+            let v = self.narrow_to_64(packed, false);
+            self.b.write(GuestReg::V128(vd.0), v);
+        }
+        Flow::Next
     }
 
     fn shift_imm(
@@ -3985,6 +4007,63 @@ impl<'a> Lifter<'a> {
                 };
                 self.b.write(GuestReg::V128(vd.0), r);
                 return Flow::Next;
+            }
+            // The saturating narrowing shifts: the shift at the wide width
+            // (arithmetic but for the `uq` forms, whose source is unsigned),
+            // rounded as `srshr` is, without overflow; then the saturating
+            // narrow `sqxtn` / `uqxtn` / `sqxtun` does. The shift is 1 up to
+            // the narrow width, always inside the wide lane. FPSR.QC is not
+            // kept, as for the other saturating lowerings.
+            VShiftImmOp::SqShrn
+            | VShiftImmOp::SqRshrn
+            | VShiftImmOp::UqShrn
+            | VShiftImmOp::UqRshrn
+            | VShiftImmOp::SqShrun
+            | VShiftImmOp::SqRshrun => {
+                let wlane = Self::lane_of(VArr {
+                    lane_bytes: arr.lane_bytes * 2,
+                    q: true,
+                    float: false,
+                    scalar: false,
+                });
+                let unsigned = matches!(op, VShiftImmOp::UqShrn | VShiftImmOp::UqRshrn);
+                let rounding = matches!(
+                    op,
+                    VShiftImmOp::SqRshrn | VShiftImmOp::UqRshrn | VShiftImmOp::SqRshrun
+                );
+                let mut shifted = self.b.def(Expr::VShift {
+                    op: if unsigned { VShiftOp::ShrU } else { VShiftOp::ShrS },
+                    lane: wlane,
+                    a,
+                    amount,
+                });
+                if rounding {
+                    let rb = self.b.const_i32(shift - 1);
+                    let dropped = self.b.def(Expr::VShift {
+                        op: VShiftOp::ShrU,
+                        lane: wlane,
+                        a,
+                        amount: rb,
+                    });
+                    let one = self.lane_splat(wlane, 1);
+                    let round = self.b.def(Expr::VBin {
+                        op: VBinOp::And,
+                        a: dropped,
+                        b: one,
+                    });
+                    shifted = self.b.def(Expr::VLaneBin {
+                        op: VLaneBinOp::Add,
+                        lane: wlane,
+                        a: shifted,
+                        b: round,
+                    });
+                }
+                let narrow = match op {
+                    VShiftImmOp::SqShrn | VShiftImmOp::SqRshrn => VOp2::SqXtn,
+                    VShiftImmOp::UqShrn | VShiftImmOp::UqRshrn => VOp2::UqXtn,
+                    _ => VOp2::SqXtun,
+                };
+                return self.sat_narrow(narrow, arr, vd, shifted);
             }
             VShiftImmOp::Shrn | VShiftImmOp::Rshrn => {
                 // The source lanes are twice as wide as `arr` describes.
@@ -4627,6 +4706,114 @@ impl<'a> Lifter<'a> {
             b: clamped,
             lanes: Box::new(lanes),
         })
+    }
+
+    /// A vector with `x` in every lane of `lane`'s width.
+    fn lane_splat(&mut self, lane: VLane, x: u64) -> Value {
+        let w = lane.bytes() as usize;
+        let mut bytes = [0u8; 16];
+        for l in 0..16 / w {
+            bytes[l * w..l * w + w].copy_from_slice(&x.to_le_bytes()[..w]);
+        }
+        self.b.def(Expr::VConst(Box::new(bytes)))
+    }
+
+    /// `sqadd`, `uqadd`, `sqsub` and `uqsub` on word and doubleword lanes, which wasm
+    /// has no saturating add or subtract for. The wrapping result is right unless it
+    /// overflowed: for the signed forms when the operands' signs agree (add) or differ
+    /// (subtract) and the result's sign is not the first operand's, which
+    /// `(r ^ a) & (r ^ b)` / `(a ^ b) & (a ^ r)` shows in the sign bit; such a lane
+    /// takes the limit on `a`'s side, `MAX ^ (a >> (bits-1))`. Unsigned, the sum
+    /// overflowed when it is below `a` (all-ones then), the difference when `a < b`
+    /// (zero then). i64x2 has no unsigned compare, so those lanes compare biased into
+    /// signed order. FPSR.QC is not kept, as for the other saturating lowerings.
+    fn sat_add_sub_wide(&mut self, op: VOp3, lane: VLane, a: Value, b: Value) -> Value {
+        let add = matches!(op, VOp3::SqAdd | VOp3::UqAdd);
+        let r = self.b.def(Expr::VLaneBin {
+            op: if add { VLaneBinOp::Add } else { VLaneBinOp::Sub },
+            lane,
+            a,
+            b,
+        });
+        let bits = lane.bytes() * 8;
+        if matches!(op, VOp3::SqAdd | VOp3::SqSub) {
+            let (x, y, z, t) = if add { (r, a, r, b) } else { (a, b, a, r) };
+            let p = self.b.def(Expr::VBin { op: VBinOp::Xor, a: x, b: y });
+            let q = self.b.def(Expr::VBin { op: VBinOp::Xor, a: z, b: t });
+            let ov = self.b.def(Expr::VBin { op: VBinOp::And, a: p, b: q });
+            let top = self.b.const_i32(bits - 1);
+            let mask = self.b.def(Expr::VShift { op: VShiftOp::ShrS, lane, a: ov, amount: top });
+            let sign = self.b.def(Expr::VShift { op: VShiftOp::ShrS, lane, a, amount: top });
+            let max = self.lane_splat(lane, u64::MAX >> (65 - bits));
+            let limit = self.b.def(Expr::VBin { op: VBinOp::Xor, a: max, b: sign });
+            return self.b.def(Expr::VBitSelect { mask, a: limit, b: r });
+        }
+        // Unsigned: `lt_u(x, y)`, the sum below `a` or `a` below `b`.
+        let (x, y) = if add { (r, a) } else { (a, b) };
+        let below = if lane == VLane::I64 {
+            let bias = self.lane_splat(lane, 1 << 63);
+            let x = self.b.def(Expr::VBin { op: VBinOp::Xor, a: x, b: bias });
+            let y = self.b.def(Expr::VBin { op: VBinOp::Xor, a: y, b: bias });
+            self.b.def(Expr::VLaneBin { op: VLaneBinOp::LtS, lane, a: x, b: y })
+        } else {
+            self.b.def(Expr::VLaneBin { op: VLaneBinOp::LtU, lane, a: x, b: y })
+        };
+        if add {
+            self.b.def(Expr::VBin { op: VBinOp::Or, a: r, b: below })
+        } else {
+            self.b.def(Expr::VBin { op: VBinOp::AndNot, a: r, b: below })
+        }
+    }
+
+    /// `sqdmulh` and `sqrdmulh`: `(2*a*b [+ 1 << (bits-1)]) >> bits` per lane, which
+    /// overflows only for `MIN * MIN`. Halfwords: the rounding form is wasm's
+    /// `i16x8.q15mulr_sat_s` exactly, and the plain one `(a*b) >> 15` from the widened
+    /// products, whose one overflow the saturating narrow takes. Words: the products
+    /// widened to i64 (`extmul`), `(p [+ 1 << 30]) >> 31` -- the same value with both
+    /// sides halved -- and the low words of that. Nothing but `MIN * MIN` gives
+    /// `0x8000_0000` there (the extreme products are `-2^62 + 2^31` and
+    /// `2^62 - 2^31`), so turning that one value into `MAX` is the saturation.
+    /// FPSR.QC is not kept, as for the other saturating lowerings.
+    fn sat_doubling_mulh(&mut self, round: bool, arr: VArr, a: Value, b: Value) -> Value {
+        if arr.lane_bytes == 2 {
+            if round {
+                return self.b.def(Expr::VLaneBin { op: VLaneBinOp::Q15MulrSatS, lane: VLane::I16, a, b });
+            }
+            let fifteen = self.b.const_i32(15);
+            let mut half = [None; 2];
+            for (i, op) in [VLaneBinOp::ExtMulLowS, VLaneBinOp::ExtMulHighS].into_iter().enumerate() {
+                let p = self.b.def(Expr::VLaneBin { op, lane: VLane::I16, a, b });
+                half[i] = Some(self.b.def(Expr::VShift { op: VShiftOp::ShrS, lane: VLane::I32, a: p, amount: fifteen }));
+            }
+            return self.b.def(Expr::VCvt {
+                op: VCvtOp::NarrowSat { signed: true },
+                from: VLane::I32,
+                a: half[0].unwrap(),
+                b: half[1],
+            });
+        }
+        // The 64-bit and scalar forms want only the low half.
+        let both = arr.q && !arr.scalar;
+        let bias = if round { Some(self.lane_splat(VLane::I64, 1 << 30)) } else { None };
+        let thirty_one = self.b.const_i32(31);
+        let mut half = Vec::new();
+        for op in [VLaneBinOp::ExtMulLowS, VLaneBinOp::ExtMulHighS].into_iter().take(if both { 2 } else { 1 }) {
+            let mut p = self.b.def(Expr::VLaneBin { op, lane: VLane::I32, a, b });
+            if let Some(bias) = bias {
+                p = self.b.def(Expr::VLaneBin { op: VLaneBinOp::Add, lane: VLane::I64, a: p, b: bias });
+            }
+            half.push(self.b.def(Expr::VShift { op: VShiftOp::ShrS, lane: VLane::I64, a: p, amount: thirty_one }));
+        }
+        let (lo, hi) = (half[0], *half.last().unwrap());
+        // Words 0 and 2 of `lo`, then of `hi` (bytes 16.. of the pair).
+        let mut lanes = [0u8; 16];
+        for (i, slot) in lanes.iter_mut().enumerate() {
+            *slot = [0u8, 8, 16, 24][i / 4] + (i % 4) as u8;
+        }
+        let packed = self.b.def(Expr::VShuffle { lanes: Box::new(lanes), a: lo, b: hi });
+        let min = self.lane_splat(VLane::I32, 0x8000_0000);
+        let over = self.b.def(Expr::VLaneBin { op: VLaneBinOp::Eq, lane: VLane::I32, a: packed, b: min });
+        self.b.def(Expr::VBin { op: VBinOp::Xor, a: packed, b: over })
     }
 
     fn narrow_to_64(&mut self, v: Value, q: bool) -> Value {

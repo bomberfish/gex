@@ -140,7 +140,7 @@ const VUNOPS: [VUnOp; 5] = [
     VUnOp::ExtAddPairwiseS8,
     VUnOp::ExtAddPairwiseS16,
 ];
-const VLANEBIN: [VLaneBinOp; 23] = [
+const VLANEBIN: [VLaneBinOp; 26] = [
     VLaneBinOp::Add,
     VLaneBinOp::Sub,
     VLaneBinOp::Mul,
@@ -154,6 +154,9 @@ const VLANEBIN: [VLaneBinOp; 23] = [
     VLaneBinOp::SubSatS,
     VLaneBinOp::SubSatU,
     VLaneBinOp::AvgrU,
+    VLaneBinOp::Q15MulrSatS,
+    VLaneBinOp::ExtMulLowS,
+    VLaneBinOp::ExtMulHighS,
     VLaneBinOp::Eq,
     VLaneBinOp::Ne,
     VLaneBinOp::LtS,

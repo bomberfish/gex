@@ -1220,6 +1220,11 @@ pub enum VOp3 {
     UqAdd,
     SqSub,
     UqSub,
+    /// Saturating doubling multiply returning the high half: `(2 * a * b) >> esize`,
+    /// and `sqrdmulh`'s rounding form, `(2 * a * b + (1 << (esize - 1))) >> esize`.
+    /// Halfword and word lanes only; only `MIN * MIN` saturates.
+    SqDmulh,
+    SqRdmulh,
     SHAdd,
     UHAdd,
     SrHAdd,
@@ -1453,6 +1458,16 @@ pub enum VShiftImmOp {
     SqShl,
     UqShl,
     SqShlU,
+    /// Saturating narrowing shifts right: like `shrn`/`rshrn`, but the shifted
+    /// wide lane is clamped into the narrow one -- signed to signed (`sqshrn`),
+    /// unsigned to unsigned (`uqshrn`), signed to unsigned (`sqshrun`). The `R`
+    /// forms round. The `2` forms (`q`) write the destination's upper half.
+    SqShrn,
+    SqRshrn,
+    UqShrn,
+    UqRshrn,
+    SqShrun,
+    SqRshrun,
     /// Fixed-point to floating point: the lane is an integer with `shift`
     /// fractional bits, so the result is it divided by `2^shift`. Shares the
     /// shift-by-immediate encoding because the scale sits in the same field.

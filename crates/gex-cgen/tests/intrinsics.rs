@@ -27,7 +27,7 @@ fn lane_ops_lower_to_tier1_opcodes() {
     use VLaneBinOp::*;
     use VLaneUnOp::*;
     let bins = [
-        Add, Sub, Mul, Div, MinS, MinU, MaxS, MaxU, AddSatS, AddSatU, SubSatS, SubSatU, AvgrU, Eq,
+        Add, Sub, Mul, Div, MinS, MinU, MaxS, MaxU, AddSatS, AddSatU, SubSatS, SubSatU, AvgrU, Q15MulrSatS, ExtMulLowS, ExtMulHighS, Eq,
         Ne, LtS, LtU, GtS, GtU, LeS, LeU, GeS, GeU,
     ];
     let uns = [Neg, Abs, Sqrt, Ceil, Floor, Trunc, Nearest];

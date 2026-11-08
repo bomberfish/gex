@@ -371,14 +371,69 @@ mod tests {
                                 VShiftOp::ShrS => (sx(l) as i64 >> n) as u64,
                             })
                         }
-                        Expr::VLaneBin { op: VLaneBinOp::Eq, lane, a, b } => {
+                        Expr::VLaneBin { op, lane, a, b } => {
                             let bits = w(*lane);
                             let (x, y) = (g(a), g(b));
                             let m = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+                            let ul = |v: u128, i: u32| (v >> (i * bits)) as u64 & m;
+                            let sl = |v: u128, i: u32| ((ul(v, i) << (64 - bits)) as i64 >> (64 - bits)) as i128;
                             let mut r = 0u128;
-                            for i in 0..128 / bits {
-                                if (x >> (i * bits)) as u64 & m == (y >> (i * bits)) as u64 & m {
-                                    r |= (m as u128) << (i * bits);
+                            if let VLaneBinOp::ExtMulLowS | VLaneBinOp::ExtMulHighS = op {
+                                // Half the lanes, each twice as wide.
+                                let base = if *op == VLaneBinOp::ExtMulLowS { 0 } else { 64 / bits };
+                                let wm = if bits == 32 { u128::from(u64::MAX) } else { (1u128 << (2 * bits)) - 1 };
+                                for i in 0..64 / bits {
+                                    let p = sl(x, base + i) * sl(y, base + i);
+                                    r |= (p as u128 & wm) << (i * 2 * bits);
+                                }
+                                r
+                            } else {
+                                for i in 0..128 / bits {
+                                    let (ux, uy, sx, sy) = (ul(x, i), ul(y, i), sl(x, i), sl(y, i));
+                                    let all = |c: bool| if c { m } else { 0 };
+                                    let out = match op {
+                                        VLaneBinOp::Add => ux.wrapping_add(uy),
+                                        VLaneBinOp::Sub => ux.wrapping_sub(uy),
+                                        VLaneBinOp::Eq => all(ux == uy),
+                                        VLaneBinOp::Ne => all(ux != uy),
+                                        VLaneBinOp::LtU => all(ux < uy),
+                                        VLaneBinOp::LtS => all(sx < sy),
+                                        VLaneBinOp::GtS => all(sx > sy),
+                                        VLaneBinOp::MinU => ux.min(uy),
+                                        VLaneBinOp::MaxS => sx.max(sy) as u64,
+                                        VLaneBinOp::Q15MulrSatS => {
+                                            assert_eq!(bits, 16);
+                                            ((sx * sy + 0x4000) >> 15).clamp(-0x8000, 0x7fff) as u64
+                                        }
+                                        o => panic!("not evaluated here: {o:?}"),
+                                    };
+                                    r |= ((out & m) as u128) << (i * bits);
+                                }
+                                r
+                            }
+                        }
+                        Expr::VShuffle { a, b, lanes } => {
+                            let (x, y) = (g(a).to_le_bytes(), g(b).to_le_bytes());
+                            let mut o = [0u8; 16];
+                            for (i, &l) in lanes.iter().enumerate() {
+                                o[i] = if l < 16 { x[l as usize] } else { y[l as usize - 16] };
+                            }
+                            u128::from_le_bytes(o)
+                        }
+                        // wasm's narrows read signed lanes, `a`'s then `b`'s, and
+                        // clamp them to the signed or unsigned narrow range.
+                        Expr::VCvt { op: gex_ir::VCvtOp::NarrowSat { signed }, from, a, b } => {
+                            let bits = w(*from);
+                            let nb = bits / 2;
+                            let (lo, hi) = if *signed { (-(1i128 << (nb - 1)), (1i128 << (nb - 1)) - 1) } else { (0, (1i128 << nb) - 1) };
+                            let src = [g(a), g(&b.expect("two operands"))];
+                            let mut r = 0u128;
+                            for (k, v) in src.iter().enumerate() {
+                                for i in 0..128 / bits {
+                                    let l = (v >> (i * bits)) as u64 & ((1u64 << bits) - 1);
+                                    let s = ((l << (64 - bits)) as i64 >> (64 - bits)) as i128;
+                                    let n = s.clamp(lo, hi) as u128 & ((1u128 << nb) - 1);
+                                    r |= n << ((k as u32 * (128 / bits) + i) * nb);
                                 }
                             }
                             r
@@ -467,6 +522,216 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// The slow path's own answer (`gex_isa::slow`, the instructions' reference
+    /// semantics) for vector word `raw` on `v`: what it leaves in `v1`.
+    fn slow_reference(raw: u32, v: &[u128; 32]) -> u128 {
+        let mut bytes = [0u8; 512];
+        for (i, r) in v.iter().enumerate() {
+            bytes[i * 16..i * 16 + 16].copy_from_slice(&r.to_le_bytes());
+        }
+        let mut fpsr = 0;
+        assert!(gex_isa::slow::execute(raw, &mut gex_isa::slow::VRegs(&mut bytes), &mut fpsr), "{raw:08x}");
+        u128::from_le_bytes(bytes[16..32].try_into().unwrap())
+    }
+
+    /// A pseudo-random source of lanes, edges first: zero, one, all-ones, the
+    /// signed limits and their neighbours, then `extra` (values the caller cares
+    /// about, such as rounding ties), then random values of random magnitude.
+    fn lane_values(esize: u32, extra: &[u64], rnd: &mut impl FnMut() -> u64) -> Vec<u64> {
+        let m = if esize == 64 { u64::MAX } else { (1u64 << esize) - 1 };
+        let max = m >> 1;
+        let mut v = vec![0, 1, m, max, max - 1, max + 1, max + 2, 2, m - 1];
+        v.extend(extra.iter().map(|x| x & m));
+        for _ in 0..24 {
+            v.push(rnd() >> (rnd() % 64) & m);
+            v.push(!(rnd() >> (rnd() % 64)) & m);
+        }
+        v
+    }
+
+    /// Fills a register's lanes from `vals`, starting at `at` and wrapping.
+    fn fill(esize: u32, vals: &[u64], at: usize) -> u128 {
+        (0..128 / esize).fold(0u128, |x, i| x | (vals[(at + i as usize * 7) % vals.len()] as u128) << (i * esize))
+    }
+
+    fn xorshift(mut seed: u64) -> impl FnMut() -> u64 {
+        move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        }
+    }
+
+    /// Lifts `raw` alone and checks it against the slow path's answer for `vraw`
+    /// (the same instruction's vector form; for a scalar form only the low
+    /// `scalar_bits` are kept) on every pair of `vals` lanes in `v2`, `v3` and `v1`.
+    fn check_against_slow(raw: u32, vraw: u32, scalar_bits: Option<u32>, esize: u32, vals: &[u64], rnd: &mut impl FnMut() -> u64) {
+        let block = lift_block(words(0x1000, &[raw]), 0x1000, BlockLimits { max_insts: 1 });
+        assert!(!matches!(block.term, Term::Illegal { .. }), "{raw:08x} lifted as illegal");
+        // No host call: the word is lowered, not sent to the slow path.
+        assert!(
+            !block.stmts.iter().any(|s| matches!(s, Stmt::HostCall { .. })),
+            "{raw:08x} still goes to the host"
+        );
+        let text = gex_isa::fmt::disasm(&decode::decode(raw, 0x1000), 0x1000);
+        for round in 0..vals.len() {
+            let mut v = [0u128; 32];
+            v[1] = (rnd() as u128) << 64 | rnd() as u128;
+            v[2] = fill(esize, vals, round);
+            v[3] = fill(esize, vals, round * 5 + 3);
+            if round % 3 == 0 {
+                v[3] = v[2]; // squares: MIN * MIN among them
+            }
+            let mut want = slow_reference(vraw, &v);
+            if let Some(b) = scalar_bits {
+                want &= (1u128 << b) - 1;
+            }
+            let got = eval_vectors(&block, &v)[&1];
+            assert_eq!(got, want, "{text} ({raw:08x}) on n={:032x} m={:032x} d={:032x}", v[2], v[3], v[1]);
+        }
+    }
+
+    /// `sqadd`, `uqadd`, `sqsub`, `uqsub` on word and doubleword lanes, vector and
+    /// scalar, against the slow path's reference: wasm saturates only narrower lanes.
+    #[test]
+    fn wide_saturating_add_and_subtract_match_the_reference() {
+        let mut rnd = xorshift(0x2545_f491_4f6c_dd1d);
+        for (u, opcode) in [(0u32, 0b00001u32), (1, 0b00001), (0, 0b00101), (1, 0b00101)] {
+            for (size, esize) in [(2u32, 32u32), (3, 64)] {
+                let vals = lane_values(esize, &[], &mut rnd);
+                for (q, scalar) in [(false, false), (true, false), (true, true)] {
+                    if esize == 64 && !q {
+                        continue;
+                    }
+                    // sqadd v1, v2, v3: 0 Q U 01110 size 1 Rm opcode 1 Rn Rd; scalar 01 U 11110 ...
+                    let vraw = (1 << 30) | (u << 29) | (0b01110 << 24) | (size << 22) | (1 << 21) | (3 << 16) | (opcode << 11) | (1 << 10) | (2 << 5) | 1;
+                    let raw = if scalar { vraw | (1 << 28) } else if q { vraw } else { vraw & !(1 << 30) };
+                    check_against_slow(raw, raw & !(1 << 28), scalar.then_some(esize), esize, &vals, &mut rnd);
+                }
+            }
+        }
+    }
+
+    /// `sqdmulh` and `sqrdmulh`, halfword and word lanes, vector, scalar and by
+    /// element (every index, and the high register bit only words can use).
+    #[test]
+    fn doubling_multiplies_match_the_reference() {
+        let mut rnd = xorshift(0x9e37_79b9_7f4a_7c15);
+        for (size, esize) in [(1u32, 16u32), (2, 32)] {
+            let min = 1u64 << (esize - 1);
+            let vals = lane_values(esize, &[min, min + 1, min - 1, min >> 1, (min >> 1) + 1], &mut rnd);
+            for u in [0u32, 1] {
+                for (q, scalar) in [(false, false), (true, false), (true, true)] {
+                    // sq(r)dmulh v1, v2, v3: 0 Q U 01110 size 1 Rm 10110 1 Rn Rd
+                    let vraw = (1 << 30) | (u << 29) | (0b01110 << 24) | (size << 22) | (1 << 21) | (3 << 16) | (0b10110 << 11) | (1 << 10) | (2 << 5) | 1;
+                    let raw = if scalar { vraw | (1 << 28) } else if q { vraw } else { vraw & !(1 << 30) };
+                    check_against_slow(raw, raw & !(1 << 28), scalar.then_some(esize), esize, &vals, &mut rnd);
+                }
+                // By element: 0 Q 0 01111 size L M Rm 110U H 0 Rn Rd, the index in H:L(:M).
+                for q in [false, true] {
+                    for index in 0..128 / esize {
+                        for rm in [3u32, 19] {
+                            let (h, l, m, rm_field) = if esize == 16 {
+                                if rm >= 16 {
+                                    continue;
+                                }
+                                (index >> 2, index >> 1 & 1, index & 1, rm)
+                            } else {
+                                (index >> 1, index & 1, rm >> 4, rm & 15)
+                            };
+                            let raw = ((q as u32) << 30) | (0b01111 << 24) | (size << 22) | (l << 21) | (m << 20) | (rm_field << 16) | ((0b1100 | u) << 12) | (h << 11) | (2 << 5) | 1;
+                            let block = lift_block(words(0x1000, &[raw]), 0x1000, BlockLimits { max_insts: 1 });
+                            assert!(!matches!(block.term, Term::Illegal { .. }), "{raw:08x} lifted as illegal");
+                            for round in 0..vals.len() {
+                                let mut v = [0u128; 32];
+                                v[1] = rnd() as u128;
+                                v[2] = fill(esize, &vals, round);
+                                v[rm as usize] = fill(esize, &vals, round * 3 + 1);
+                                let want = slow_reference(raw, &v);
+                                let got = eval_vectors(&block, &v)[&1];
+                                assert_eq!(got, want, "{raw:08x} index {index} on n={:032x} m={:032x}", v[2], v[rm as usize]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// `sqshrn`, `sqrshrn`, `uqshrn`, `uqrshrn`, `sqshrun` and `sqrshrun`: every
+    /// width, every shift, the lower and upper (`2`) halves and the scalar forms,
+    /// with rounding ties and the values either side of saturation among the lanes.
+    #[test]
+    fn saturating_narrowing_shifts_match_the_reference() {
+        let mut rnd = xorshift(0xd1b5_4a32_d192_ed03);
+        for (u, opcode) in [(0u32, 0b10010u32), (0, 0b10011), (1, 0b10010), (1, 0b10011), (1, 0b10000), (1, 0b10001)] {
+            for esize in [8u32, 16, 32] {
+                for shift in 1..=esize {
+                    let wide = 2 * esize;
+                    let wm = (1u128 << wide) - 1;
+                    let mut extra = Vec::new();
+                    for k in [0u64, 1, 2, 3] {
+                        // Ties, either side of them, and the saturation edges after the shift.
+                        let half = 1u128 << (shift - 1);
+                        for base in [(k as u128) << shift, (((1u128 << (esize - 1)) - k as u128) << shift), (((1u128 << esize) - k as u128) << shift)] {
+                            for d in [half, half - 1, half + 1, 0] {
+                                extra.push(((base + d) & wm) as u64);
+                                extra.push(((base.wrapping_neg().wrapping_add(d)) & wm) as u64);
+                            }
+                        }
+                    }
+                    let vals = lane_values(wide, &extra, &mut rnd);
+                    for (q, scalar) in [(false, false), (true, false), (true, true)] {
+                        // sqshrn v1, v2, #shift: 0 Q U 011110 immh:immb opcode 1 Rn Rd; scalar 01 U 111110 ...
+                        let imm = 2 * esize - shift;
+                        let fields = (u << 29) | (imm << 16) | (opcode << 11) | (1 << 10) | (2 << 5) | 1;
+                        let vform = |q: bool| ((q as u32) << 30) | (0b011110 << 23) | fields;
+                        let raw = if scalar { (1 << 30) | (0b111110 << 23) | fields } else { vform(q) };
+                        // The reference runs the low-half vector form for a scalar one.
+                        let vraw = if scalar { vform(false) } else { raw };
+                        let block = lift_block(words(0x1000, &[raw]), 0x1000, BlockLimits { max_insts: 1 });
+                        assert!(!matches!(block.term, Term::Illegal { .. }), "{raw:08x} lifted as illegal");
+                        let text = gex_isa::fmt::disasm(&decode::decode(raw, 0x1000), 0x1000);
+                        for round in 0..vals.len() {
+                            let mut v = [0u128; 32];
+                            v[1] = (rnd() as u128) << 64 | rnd() as u128;
+                            v[2] = fill(wide, &vals, round);
+                            let mut want = slow_reference(vraw, &v);
+                            if scalar {
+                                want &= (1u128 << esize) - 1;
+                            }
+                            let got = eval_vectors(&block, &v)[&1];
+                            assert_eq!(got, want, "{text} ({raw:08x}) on n={:032x} d={:032x}", v[2], v[1]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The saturating fixed-point words lift to wasm SIMD with no host call.
+    #[test]
+    fn hot_saturating_words_are_lowered() {
+        for raw in [
+            0x4ea00c00_u32, // sqadd v0.4s, v0.4s, v0.4s
+            0x0ea00c00,     // sqadd v0.2s
+            0x0ea02c00,     // sqsub v0.2s
+            0x4f80d000,     // sqrdmulh v0.4s, v0.4s, v0.s[0]
+            0x6ea0b400,     // sqrdmulh v0.4s, v0.4s, v0.4s
+            0x0f209c00,     // sqrshrn v0.2s, v0.2d, #32
+            0x4f209c00,     // sqrshrn2 v0.4s, v0.2d, #32
+            0x0f209400,     // sqshrn v0.2s, v0.2d, #32
+        ] {
+            let block = lift_block(words(0x1000, &[raw]), 0x1000, BlockLimits { max_insts: 1 });
+            assert!(!matches!(block.term, Term::Illegal { .. }), "{raw:08x} lifted as illegal");
+            assert!(
+                !block.stmts.iter().any(|s| matches!(s, Stmt::HostCall { .. })),
+                "{raw:08x} still goes to the host"
+            );
         }
     }
 
