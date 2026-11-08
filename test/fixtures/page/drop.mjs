@@ -18,7 +18,9 @@
  *   - a move into a folder that has a name already numbers it ("a (2).txt"),
  *     and so does a drop into one, or a name the drop has twice; neither
  *     writes over a file there, and an aborted drop into it removes only
- *     what it made.
+ *     what it made;
+ *   - a file is written under a hidden name and renamed to its own when
+ *     whole (a watcher of the folder never sees it part written).
  *
  * Usage: node test/fixtures/page/drop.mjs [gex_kernel.x86.wasm]
  */
@@ -218,8 +220,31 @@ send({ abort: 10 });
 const j = await answer(10);
 check(j.aborted && read('/home/u/Desktop/a.txt')?.toString() === 'a' && meta('/home/u/Desktop/a (5).txt') === null,
   `an aborted drop into a folder: ${JSON.stringify(j)}`);
+check(meta('/home/u/Desktop/.a.txt.10.drop-part') === null, 'an aborted drop leaves no part-written file');
 // An abort for a drop that has ended is dropped, not kept for a later one.
 send({ abort: 9 });
 
+// A file is written under a hidden name and has its own only when whole:
+// between its chunks (a File read slowly), the name is not there yet.
+const seen = [];
+const slow = {
+  name: 'slow.exe', size: 3, lastModified: 1650000000000,
+  stream() {
+    let n = 0;
+    return new ReadableStream({
+      pull(c) {
+        seen.push([meta('/home/u/Desktop/slow.exe') !== null, meta('/home/u/Desktop/.slow.exe.11.drop-part') !== null]);
+        if (n === 3) c.close();
+        else c.enqueue(new Uint8Array([77 + n++]));
+      },
+    });
+  },
+};
+send({ id: 11, dir: '/home/u/Desktop', root: '/tmp/drops', entries: [{ path: 'slow.exe', file: slow }] });
+const l = await answer(11);
+check(l.done && read('/home/u/Desktop/slow.exe')?.toString() === 'MNO', `a slowly read drop: ${JSON.stringify(l)}`);
+check(seen.length >= 3 && seen.slice(1).every(([whole, part]) => !whole && part), `its name only once whole: ${JSON.stringify(seen)}`);
+check(meta('/home/u/Desktop/.slow.exe.11.drop-part') === null, 'and the hidden name gone');
+
 if (failed) process.exit(1);
-console.log('check-drop: ok (two drops by handle and by entry, modes, times, progress, abort, numbered moves and drops into a folder)');
+console.log('check-drop: ok (two drops by handle and by entry, modes, times, progress, abort, numbered moves and drops into a folder, renamed when whole)');

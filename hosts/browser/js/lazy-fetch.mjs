@@ -4,6 +4,8 @@
 // there anyway); it fills `len` bytes at `dst` in the kernel's memory.
 // Where there is no XMLHttpRequest (Node), lazy files cannot be read.
 import { noteFetch } from './fetch-note.mjs';
+import { logNamed } from './log.mjs';
+import { lateZstd } from './zstd-late.mjs';
 import { CHUNK, OWNER_FAILED, cachedRead, lazyCacheOn, FailedFrames, retrySync } from './lazy-cache.mjs';
 
 // The background fill (app.js `fill`): lazy files the page downloads, packed
@@ -90,11 +92,12 @@ let zstdLoad = null;
  *  bundle (the page says, `GEX_REST_BUNDLE`), or where the page's lazy-file
  *  owner reads it for every Worker (lazy-cache.mjs): a decoder is an engine
  *  memory reservation, and one in each of a desktop's Workers ran the page
- *  out of them. */
+ *  out of them. Compiled here; its instance (and memory) only at a first
+ *  decode (zstd-late.mjs). */
 export function lazyReady() {
   if (lazyCacheOn() || !globalThis.GEX_REST_BUNDLE) return Promise.resolve();
-  zstdLoad ??= import('../../../page/vendor/zstddec/zstddec-stream.mjs')
-    .then(async ({ ZSTDDecoder }) => { const d = new ZSTDDecoder(); await d.init(); zstd = d; })
+  zstdLoad ??= lateZstd(import('../../../page/vendor/zstddec/zstddec-stream.mjs'), new URL('../../../page/vendor/zstddec/zstddec.wasm', import.meta.url).href)
+    .then((d) => { zstd = d; })
     .catch((e) => { console.error(`[lazy] no zstd decoder: ${e?.message ?? e}`); });
   return zstdLoad;
 }
@@ -217,10 +220,77 @@ const emptyMemories = new Map();
  * memory" as a thread joined).
  */
 export function spareMemories(shared = true) {
-  return {
-    m32: new WebAssembly.Memory({ initial: 0, maximum: 0, shared }),
-    m64: new WebAssembly.Memory({ address: 'i64', initial: 0n, maximum: 0n, shared }),
-  };
+  // the tab's count of them (`wasmMemory`): live, the most at once, and a
+  // test's cap (`setTabMemoriesMax`)
+  const count = new Int32Array(typeof SharedArrayBuffer === 'function' ? new SharedArrayBuffer(12) : new ArrayBuffer(12));
+  globalThis[PAGE_COUNT] ??= count;
+  const spare = { count };
+  spare.m32 = wasmMemory({ initial: 0, maximum: 0, shared }, 'the spare 32-bit memory', spare);
+  spare.m64 = wasmMemory({ address: 'i64', initial: 0n, maximum: 0n, shared }, 'the spare memory64', spare);
+  return spare;
+}
+
+// The first kernel spec's count, for this realm's memories made without one:
+// on the realm, not in this module, as a built package has its own copy of
+// this module beside the one a page or a test imports.
+const PAGE_COUNT = Symbol.for('gex.tabMemories');
+const pageCount = () => globalThis[PAGE_COUNT] ?? null;
+
+/** The tab's wasm memories as `wasmMemory` counted them, `{ live, peak }`
+ *  (the kernel spec `spare`'s count, or this realm's first), or null.
+ *  `peak` from `reset` on, when given. */
+export function tabMemories(spare = null, { reset = false } = {}) {
+  const c = spare?.count ?? pageCount();
+  if (!c) return null;
+  if (reset) Atomics.store(c, 1, Atomics.load(c, 0));
+  return { live: Atomics.load(c, 0), peak: Atomics.load(c, 1) };
+}
+
+/** A test switch: the tab holds at most `n` memories (0: no cap) from now
+ *  on, every Worker of it, as a browser whose address space ran out (Node
+ *  has no such limit). */
+export function setTabMemoriesMax(n, spare = null) {
+  const c = spare?.count ?? pageCount();
+  if (c) Atomics.store(c, 2, n | 0);
+}
+
+/**
+ * `new WebAssembly.Memory(desc)`, counted in the tab's live count (`spare`:
+ * the kernel spec's, which every Worker has), `what` it is for the
+ * `GEX_LOG=mem` line. An engine reserves address space for each memory
+ * whatever its size, about 8 GiB a 32-bit one and 16 GiB a memory64, and a
+ * Chromium tab has about 1 TiB of it: about 124 memories. When none is
+ * left, the error says so in plain words rather than the engine's
+ * "could not allocate memory". Pairs with `wasmMemoryGone`.
+ */
+export function wasmMemory(desc, what, spare = null) {
+  let m;
+  try {
+    // a test's cap (`setTabMemoriesMax`)
+    const c = spare?.count ?? pageCount();
+    if (c && Atomics.load(c, 2) > 0 && Atomics.load(c, 0) >= Atomics.load(c, 2)) throw new RangeError('WebAssembly.Memory(): could not allocate memory');
+    m = new WebAssembly.Memory(desc);
+  } catch (e) {
+    if (!(e instanceof RangeError)) throw e;
+    const n = tabMemories(spare);
+    throw new Error(`the tab can hold no more process memories (${what}${n ? `; it holds ${n.live}` : ''}: ` +
+      'a browser reserves about 8 GiB of address space for each, and a tab has about 1 TiB)', { cause: e });
+  }
+  const c = spare?.count ?? pageCount();
+  if (c) {
+    const live = Atomics.add(c, 0, 1) + 1;
+    for (let p = Atomics.load(c, 1); p < live && Atomics.compareExchange(c, 1, p, live) !== p; p = Atomics.load(c, 1));
+    if (logNamed('mem')) console.warn(`[mem] tab memories: ${live} live: +1 ${what}`);
+  }
+  return m;
+}
+
+/** A memory `wasmMemory` counted is let go (`what`, for the log line). */
+export function wasmMemoryGone(what, spare = null) {
+  const c = spare?.count ?? pageCount();
+  if (!c) return;
+  const live = Atomics.sub(c, 0, 1) - 1;
+  if (logNamed('mem')) console.warn(`[mem] tab memories: ${live} live: -1 ${what}`);
 }
 
 /**
@@ -239,8 +309,8 @@ export function processMemories(mem, is64 = false, spare = null) {
   empty ??= emptyMemories.get(key);
   if (!empty) {
     empty = is64
-      ? new WebAssembly.Memory({ initial: 0, maximum: 0, shared })
-      : new WebAssembly.Memory({ address: 'i64', initial: 0n, maximum: 0n, shared });
+      ? wasmMemory({ initial: 0, maximum: 0, shared }, 'an empty 32-bit memory', spare)
+      : wasmMemory({ address: 'i64', initial: 0n, maximum: 0n, shared }, 'an empty memory64', spare);
     emptyMemories.set(key, empty);
   }
   return is64 ? { process: empty, process64: mem } : { process: mem, process64: empty };

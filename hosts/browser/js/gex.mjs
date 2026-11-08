@@ -11,7 +11,7 @@ const GUEST_BYTES = 0xffff0000;
 // memory64 of `gex_abi::LIMIT64` (16 GiB). The shim's own addresses (its
 // stack, data and the low runtime words) stay below 4 GiB either way; only
 // the memory's type and the i64 globals of a wasm64 module differ.
-import { kernelThread, lazyFetch, lazyReady, processMemories } from "./lazy-fetch.mjs";
+import { kernelThread, lazyFetch, lazyReady, processMemories, wasmMemory, wasmMemoryGone } from "./lazy-fetch.mjs";
 import { blockIo } from './blocks.mjs';
 import { SP_CODE } from './mode.mjs';
 import { pageFs, pageFsSuspending } from './page-fs.mjs';
@@ -1596,6 +1596,9 @@ export class Gex {
   // table, file table, pipes), instantiated by every Worker against the same
   // shared kernel memory. Null is a run of one process, which needs none of it.
   #kernelSpec = null;
+  /** This instance made its memory (a process's first Worker): `releaseWorker`
+   *  takes it off the tab's count. */
+  #ownsMemory = false;
   /** The single-thread build: the fiber this runtime runs on (single.mjs
    *  `FiberWorker`), whose waits and turns end with it. */
   #fiber = null;
@@ -1732,11 +1735,14 @@ export class Gex {
     // `memory` adopts a process's existing address space rather than making a
     // new one -- which is what a *thread* is: a second Worker on the same
     // memory, seeing the same guest and kernel. A new memory is a new process.
+    // (counted in the tab's memories, `wasmMemory`, until this instance's
+    // Worker is released)
+    this.#ownsMemory = !memory;
     this.#memory =
       memory ??
       (this.#wide
-        ? new WebAssembly.Memory({ address: 'i64', initial: BigInt(INITIAL_PAGES), maximum: BigInt(LIMIT64_BYTES / 65536), shared })
-        : new WebAssembly.Memory({ initial: INITIAL_PAGES, maximum: memCapPages() ?? PAGES, shared }));
+        ? wasmMemory({ address: 'i64', initial: BigInt(INITIAL_PAGES), maximum: BigInt(LIMIT64_BYTES / 65536), shared }, 'a process memory64', kernel?.spare)
+        : wasmMemory({ initial: INITIAL_PAGES, maximum: memCapPages() ?? PAGES, shared }, 'a process memory', kernel?.spare));
     this.#kernelSpec = kernel;
   }
 
@@ -2037,7 +2043,9 @@ export class Gex {
     return this.#memory;
   }
 
-  releaseWorker() {
+  /** `threw`: after a throw (worker.mjs), which may have left the shim's
+   *  heap mid-call, so nothing more is asked of it. */
+  releaseWorker(threw = false) {
     if (this.#stackTop === null) return;
     // The census first: its timer calls into this instance every 3 s
     // (gex_alloc, gex_wait_census). An ordinary exit has `close` stop it
@@ -2050,8 +2058,18 @@ export class Gex {
       this.#census = null;
     }
     this.#released = true;
+    // this Worker's late-call flags (`#lateFlagsAt`): no thunk reads them now
+    const chunks = threw ? null : this.#cgen?.lateChunks;
+    if (chunks) {
+      this.#cgen.lateChunks = null;
+      try { for (const [at, n] of chunks) this.#shim.exports.gex_free?.(at, n); } catch {}
+    }
     try { this.#shim?.exports?.gex_worker_release?.(); } catch {}
     this.#stackTop = null;
+    if (this.#ownsMemory) {
+      this.#ownsMemory = false;
+      wasmMemoryGone(this.#wide ? 'a process memory64' : 'a process memory', this.#kernelSpec?.spare);
+    }
   }
 
   /**
@@ -5728,7 +5746,7 @@ export class Gex {
         127, 32, 0, 35, 0, 106, 65, 2, 116, 34, 1, 40, 2, 0, 34, 2, 69, 4, 64, 32, 0, 16, 0, 11, 32, 1, 32, 2, 65, 1, 106,
         65, 127, 32, 2, 65, 127, 71, 27, 54, 2, 0, 11]);
       this.#covMod ??= new WebAssembly.Module(wasm);
-      this.#covMem ??= new WebAssembly.Memory({ initial: 1 });
+      this.#covMem ??= wasmMemory({ initial: 1 }, 'the coverage counters', this.#kernelSpec?.spare);
       const off = this.#covUsed;
       this.#covUsed += slots;
       const need = Math.ceil((4 * this.#covUsed) / 65536) - this.#covMem.buffer.byteLength / 65536;
@@ -6438,8 +6456,8 @@ export class Gex {
     const set = (m, name, v) => { (imports[m] ??= {})[name] = v; };
     const s = {}, lines = [];
     const t = st.ftab, empty = t.get(tIdx(this.#wide, 0));
-    // the module's ready flags, a byte each from `base` in the Worker's
-    // store (`#lateFlags`), which its thunks read
+    // the module's ready flags, a byte each from `base`: this Worker's, in
+    // the process memory (`#lateFlagsAt`), which its thunks read
     let base = -1;
     for (const line of text.split('\n')) {
       if (!line) continue;
@@ -6461,7 +6479,7 @@ export class Gex {
           // instantiated here (#wasmdllLate): a wasm thunk (cgen/wasmdll.rs
           // `late_thunks`) calls the slot once its flag is set, and before
           // that this, which catches up first
-          if (base < 0) base = this.#lateFlagsTop(st);
+          if (base < 0) base = this.#lateFlagsAt(st, text);
           const n = Number(f[3]), slot = tIdx(this.#wide, n), flag = base + Number(f[4]);
           const ready = st.lateReady ??= new Map();
           const had = ready.get(n);
@@ -6469,7 +6487,7 @@ export class Gex {
           else if (typeof had === 'number') ready.set(n, [had, flag]);
           else had.push(flag);
           const fn = t.get(slot);
-          if (fn && fn !== empty) st.lateBytes[flag] = 1;
+          if (fn && fn !== empty) this.#bytes()[flag] = 1;
           s[f[4]] = (...a) => this.#lateMiss(st, slot, flag, f[2], a);
           lines.push([f[1], f[2], f[4]]);
           break;
@@ -6489,23 +6507,24 @@ export class Gex {
         }
         this.#wasmdllThunkMods.set(prov, mod);
       }
-      st.lateFlagsTop = base + lines.length;
-      const x = new WebAssembly.Instance(mod, { t: { t: st.ftab }, s, r: { m: st.lateFlags, b: new WebAssembly.Global({ value: 'i32', mutable: false }, base) } }).exports;
+      const b = this.#wide ? new WebAssembly.Global({ value: 'i64', mutable: false }, BigInt(base)) : new WebAssembly.Global({ value: 'i32', mutable: false }, base);
+      const x = new WebAssembly.Instance(mod, { t: { t: st.ftab }, s, r: { m: this.#memory, b } }).exports;
       for (const [m, name, k] of lines) set(m, name, x[k]);
     }
   }
 
-  /** The next free byte of `st`'s ready-flag store (one per process, in this
-   *  Worker), which has room for one more module's flags after it. */
-  #lateFlagsTop(st) {
-    const top = st.lateFlagsTop ?? 0;
-    // no module has more `L` lines than this; grown before each module's
-    const room = 1 << 16;
-    if (!st.lateFlags) st.lateFlags = new WebAssembly.Memory({ initial: 1 });
-    const need = Math.ceil((top + room) / 65536) - st.lateFlags.buffer.byteLength / 65536;
-    if (need > 0) st.lateFlags.grow(need);
-    st.lateBytes = new Uint8Array(st.lateFlags.buffer);
-    return top;
+  /** Where this Worker's ready flags for a module with binding list `text`
+   *  go: a byte per `L` line, zeroed, from the shim's heap in the process
+   *  memory (given back when the Worker is: `releaseWorker`). Not a memory
+   *  of their own: an engine reserves the same address space for any
+   *  memory however small (8 GiB a 32-bit one), a tab has room for about
+   *  124, and a memory per thread ran a page out of them. */
+  #lateFlagsAt(st, text) {
+    let n = 0;
+    for (const line of text.split('\n')) if (line.startsWith('L\t')) n++;
+    const at = this.#shim.exports.gex_alloc(n) >>> 0;
+    (st.lateChunks ??= []).push([at, n]);
+    return at;
   }
 
   /** A late call before its slot's flag is set: the Worker catches up, and
@@ -6519,7 +6538,7 @@ export class Gex {
       fn = t.get(slot);
       if (!fn || fn === empty) throw new Error(`${name}: its module is not installed`);
     }
-    st.lateBytes[flag] = 1;
+    this.#bytes()[flag] = 1;
     return fn(...a);
   }
 
@@ -6573,8 +6592,8 @@ export class Gex {
       if (typeof f !== 'function') return;
       st.ftab.set(i, f);
       const r = st.lateReady?.get(l.slot);
-      if (typeof r === 'number') st.lateBytes[r] = 1;
-      else if (r) for (const k of r) st.lateBytes[k] = 1;
+      if (typeof r === 'number') this.#bytes()[r] = 1;
+      else if (r) for (const k of r) this.#bytes()[k] = 1;
     };
     for (const l of fresh) fill(l);
     if (prov !== undefined) {

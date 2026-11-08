@@ -27,7 +27,7 @@ pub const MANIFEST: &str = "build/web/manifest.json";
 /// The browser runtime's JavaScript, as built into this gexc.
 pub const GEX_MJS: &str = include_str!("../../../hosts/browser/js/gex.mjs");
 /// The modules `gex.mjs` imports, vendored beside it.
-pub const GEX_MJS_DEPS: [(&str, &str); 10] = [
+pub const GEX_MJS_DEPS: [(&str, &str); 11] = [
     ("lazy-fetch.mjs", include_str!("../../../hosts/browser/js/lazy-fetch.mjs")),
     ("fetch-note.mjs", include_str!("../../../hosts/browser/js/fetch-note.mjs")),
     ("xcache.mjs", include_str!("../../../hosts/browser/js/xcache.mjs")),
@@ -38,6 +38,7 @@ pub const GEX_MJS_DEPS: [(&str, &str); 10] = [
     ("dgram-frames.mjs", include_str!("../../../hosts/browser/js/dgram-frames.mjs")),
     ("mode.mjs", include_str!("../../../hosts/browser/js/mode.mjs")),
     ("blocks.mjs", include_str!("../../../hosts/browser/js/blocks.mjs")),
+    ("zstd-late.mjs", include_str!("../../../hosts/browser/js/zstd-late.mjs")),
 ];
 
 /// Why this project cannot have a web build, if it cannot.

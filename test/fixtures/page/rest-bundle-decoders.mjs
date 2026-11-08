@@ -9,7 +9,8 @@
 //   a site with one, and the page's lazy-file owner (lazy-cache-worker.js):
 //     no Worker loads one, the owner loads exactly one, and every Worker's
 //     read of a rest bundle file through the owner gives the file's bytes;
-//   a site with one and no owner: a Worker loads its own, as before.
+//   a site with one and no owner: a Worker compiles its own, and makes its
+//     instance (and memory) only at a first decode.
 //
 // Workers are worker threads that do what a page Worker does before and
 // after its kernel starts (worker.mjs: `setLazyCache`, the rest bundle
@@ -76,14 +77,23 @@ server = spawn(process.execPath, ['-e', `
 const port = await new Promise((r) => server.stdout.once('data', (d) => r(Number(String(d).trim()))));
 const bundle = `http://127.0.0.1:${port}/rest.bin`;
 
-// Counts zstddec's instantiations in the thread it runs in.
+// Counts zstddec's instances in the thread it runs in: the package's own
+// asynchronous ones and the late, synchronous one (zstd-late.mjs).
 const counter = `
-  let decoders = 0;
+  let decoders = 0, compiled = 0;
+  const compile = WebAssembly.compile;
+  WebAssembly.compile = function (...args) { compiled++; return compile.apply(WebAssembly, args); };
   const instantiate = WebAssembly.instantiate;
   WebAssembly.instantiate = function (bytes, imports, ...rest) {
     if (imports?.env?.emscripten_notify_memory_growth) decoders++;
     return instantiate.call(WebAssembly, bytes, imports, ...rest);
   };
+  WebAssembly.Instance = new Proxy(WebAssembly.Instance, {
+    construct(target, args, nt) {
+      if (args[1]?.env?.emscripten_notify_memory_growth) decoders++;
+      return Reflect.construct(target, args, nt);
+    },
+  });
 `;
 
 // The owner, with \`self\` and a Cache Storage on disk; asked 'count', it
@@ -126,7 +136,7 @@ const readerSrc = `
       mem.set(url, d.urlAt);
       got.push(read(d.urlAt, url.length, BigInt(from), dst, len));
     }
-    parentPort.postMessage({ decoders, got });
+    parentPort.postMessage({ decoders, compiled, got });
   })().catch((e) => parentPort.postMessage({ error: String(e?.stack ?? e) }));
 `;
 const lazyCache = gexUrl('hosts/browser/js/lazy-cache.mjs'), lazyFetch = gexUrl('hosts/browser/js/lazy-fetch.mjs');
@@ -173,11 +183,13 @@ results.forEach((res, w) => {
 if (ownerCount !== 1) fail(`a site with a rest bundle: the owner loaded ${ownerCount} decoders, not 1`);
 
 // 3. A rest bundle and no owner (no shared Cache Storage): the Worker
-// loads its own, as before.
+// readies its own before its kernel starts, compiled, its instance (and
+// memory) left to its first decode (zstd-late.mjs), which a thread that
+// never decodes never makes.
 const alone = await runReader({ restBundle: true });
 if (alone.error) fail(`no owner: ${alone.error}`);
-if (alone.decoders !== 1) fail(`a rest bundle with no owner: a Worker loaded ${alone.decoders} decoders, not 1`);
+if (alone.compiled !== 1 || alone.decoders !== 0) fail(`a rest bundle with no owner: a Worker compiled ${alone.compiled} decoders and made ${alone.decoders} instances before any decode, not 1 and 0`);
 
 cleanup();
-console.log(`ok   rest bundle decoders: none without a rest bundle; with one, 0 in each of ${plans.length} Workers and 1 in the owner, ${plans.length * spans.length} reads right; 1 in a Worker with no owner`);
+console.log(`ok   rest bundle decoders: none without a rest bundle; with one, 0 in each of ${plans.length} Workers and 1 in the owner, ${plans.length * spans.length} reads right; with no owner 1 compiled in a Worker and no instance before a decode`);
 process.exit(0);

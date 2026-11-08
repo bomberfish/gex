@@ -8,7 +8,8 @@
 // are (so a kept root keeps them), into one directory: the one
 // the page named, or a new /tmp/drops/N. Nothing there is written over: a
 // top-level name it has already is numbered, "a (2).txt", as is one the
-// drop has twice. Directories are made
+// drop has twice. Each file is written under a hidden name beside its own
+// (".NAME.ID.drop-part") and renamed when whole. Directories are made
 // 0755, files 0644, or 0755 when they start as a program does ("\x7fELF" or
 // "#!"); ownership is the guest's one user's (the kernel keeps none).
 // Each file is stamped with its File's lastModified (the kernel has no
@@ -68,6 +69,14 @@ const unlink = (p) => k.k_fs_unlink(BigInt(PATH_AT), putPath(p));
 const rmdir = (p) => k.k_fs_rmdir(BigInt(PATH_AT), putPath(p));
 const chmod = (p, mode) => k.k_fs_chmod(BigInt(PATH_AT), putPath(p), mode);
 const setMtime = (p, ms) => k.k_fs_set_mtime(BigInt(PATH_AT), putPath(p), BigInt(Math.floor(ms / 1000)));
+/** `src` renamed `dst`, never over a name already there (RENAME_NOREPLACE). */
+function rename(src, dst) {
+  const sb = enc.encode(src);
+  const db = enc.encode(dst);
+  view(PATH_AT + sb.length + db.length).set(sb, PATH_AT);
+  new Uint8Array(mem.buffer).set(db, PATH_AT + sb.length);
+  return k.k_fs_rename(BigInt(PATH_AT), sb.length, BigInt(PATH_AT + sb.length), db.length, 1);
+}
 /** An open file's access and modification times, both `ms` (Unix ms). */
 function stamp(h, ms, nowMs) {
   const s = BigInt(Math.floor(ms / 1000));
@@ -198,15 +207,16 @@ async function copy(m) {
         }
         continue;
       }
-      // O_EXCL: never a file that is there already (see `place`).
+      // Written under a hidden name beside its own and renamed once whole:
+      // a program watching the folder (explorer's desktop reads a program's
+      // icon as it comes) never sees a file part written. O_EXCL: never a
+      // file that is there already.
       const open = (p) => k.k_fs_open(BigInt(PATH_AT), putPath(p), BigInt(O_WRONLY | O_CREAT | O_EXCL), 0o644);
-      let h = open(path);
-      if (h === -EEXIST) {
-        const again = replace(e.path);
-        if (again) h = open((path = again));
-      }
-      if (h < 0) throw new Error(`open ${path}: errno ${-h}`);
-      made.push([path, false]);
+      const slash = path.lastIndexOf('/');
+      const part = `${path.slice(0, slash)}/.${path.slice(slash + 1)}.${m.id}.drop-part`;
+      const h = open(part);
+      if (h < 0) throw new Error(`open ${part}: errno ${-h}`);
+      made.push([part, false]);
       let off = 0;
       let program = false;
       const reader = e.file.stream().getReader();
@@ -237,6 +247,14 @@ async function copy(m) {
         // Stopped part way: the browser need not read the rest of the File.
         if (!finished) reader.cancel().catch(() => {});
       }
+      // (see `place`: a name something else took since, the next free one)
+      let r = rename(part, path);
+      if (r === -EEXIST) {
+        const again = replace(e.path);
+        if (again) r = rename(part, (path = again));
+      }
+      if (r < 0) throw new Error(`rename ${part} to ${path}: errno ${-r}`);
+      made[made.length - 1] = [path, false];
       if (program) chmod(path, 0o755);
       filesDone++;
       progress(e.path);
@@ -266,12 +284,7 @@ function move({ from, names, into }) {
     const src = `${from}/${name}`;
     for (let n = 1; ; n++) {
       const dst = `${into}/${n === 1 ? name : numbered(name, n)}`;
-      const sb = enc.encode(src);
-      const db = enc.encode(dst);
-      view(PATH_AT + sb.length + db.length).set(sb, PATH_AT);
-      new Uint8Array(mem.buffer).set(db, PATH_AT + sb.length);
-      // RENAME_NOREPLACE: a name already there is not overwritten.
-      const r = k.k_fs_rename(BigInt(PATH_AT), sb.length, BigInt(PATH_AT + sb.length), db.length, 1);
+      const r = rename(src, dst);
       if (r === 0) {
         paths.push(dst);
         break;

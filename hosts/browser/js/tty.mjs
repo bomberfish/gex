@@ -12,7 +12,7 @@
 //
 // Without a `SharedArrayBuffer` there is no global kernel: `open` answers null
 // and the caller keeps its own line discipline.
-import { helperStackTop, kernelThread, lazyFetch, processMemories } from './lazy-fetch.mjs';
+import { helperStackTop, kernelThread, lazyFetch, processMemories, wasmMemory, wasmMemoryGone } from './lazy-fetch.mjs';
 import { blockIo } from './blocks.mjs';
 import { pageFs } from './page-fs.mjs';
 import { single, sched } from './single.mjs';
@@ -76,14 +76,15 @@ export class PageTty {
     let scratch;
     try {
       try {
-        scratch = new WebAssembly.Memory({ initial: 1, maximum: 65535, shared: true });
+        scratch = wasmMemory({ initial: 1, maximum: 65535, shared: true }, "the terminal's scratch memory", spec.spare);
         inst = await WebAssembly.instantiate(mod, {
-          env: { memory: spec.memory, ...processMemories(scratch), lazy_fetch: lazyFetch(spec.memory), block_io: blockIo(spec.memory), page_fs: pageFs(spec.memory) },
+          env: { memory: spec.memory, ...processMemories(scratch, false, spec.spare), lazy_fetch: lazyFetch(spec.memory), block_io: blockIo(spec.memory), page_fs: pageFs(spec.memory) },
         });
       } catch {
-        scratch = new WebAssembly.Memory({ initial: 1, maximum: 65535 });
+        wasmMemoryGone("the terminal's scratch memory", spec.spare);
+        scratch = wasmMemory({ initial: 1, maximum: 65535 }, "the terminal's scratch memory", spec.spare);
         inst = await WebAssembly.instantiate(mod, {
-          env: { memory: spec.memory, ...processMemories(scratch), lazy_fetch: lazyFetch(spec.memory), block_io: blockIo(spec.memory), page_fs: pageFs(spec.memory) },
+          env: { memory: spec.memory, ...processMemories(scratch, false, spec.spare), lazy_fetch: lazyFetch(spec.memory), block_io: blockIo(spec.memory), page_fs: pageFs(spec.memory) },
         });
       }
     } catch (e) {

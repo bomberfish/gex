@@ -3,7 +3,7 @@
 // paths and bytes in a scratch "process" memory of its own; a Worker and not
 // the page because the kernel's locks may wait, and the page's thread cannot.
 
-import { kernelThread, lazyFetch, processMemories } from '../../hosts/browser/js/lazy-fetch.mjs';
+import { kernelThread, lazyFetch, processMemories, wasmMemory, wasmMemoryGone } from '../../hosts/browser/js/lazy-fetch.mjs';
 import { blockIo } from '../../hosts/browser/js/blocks.mjs';
 import { pageFs, pageFsSuspending, setPageFs } from '../../hosts/browser/js/page-fs.mjs';
 
@@ -24,13 +24,14 @@ export async function helperKernel(spec, stackTop, pages = 16, { suspending = fa
   let inst;
   let mem;
   for (const shared of [true, false]) {
-    mem = new WebAssembly.Memory({ initial: pages, maximum: 65535, shared });
+    mem = wasmMemory({ initial: pages, maximum: 65535, shared }, "a helper's scratch memory", spec.spare);
     try {
       inst = await WebAssembly.instantiate(spec.module, {
-        env: { memory: spec.memory, ...processMemories(mem), lazy_fetch: lazyFetch(spec.memory), block_io: blockIo(spec.memory), page_fs: suspending ? pageFsSuspending(spec.memory) : pageFs(spec.memory) },
+        env: { memory: spec.memory, ...processMemories(mem, false, spec.spare), lazy_fetch: lazyFetch(spec.memory), block_io: blockIo(spec.memory), page_fs: suspending ? pageFsSuspending(spec.memory) : pageFs(spec.memory) },
       });
       break;
     } catch (e) {
+      wasmMemoryGone("a helper's scratch memory", spec.spare);
       if (!shared) throw e;
     }
   }

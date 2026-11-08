@@ -77,10 +77,12 @@ async function forkBulkIn(child) {
 // Static, not a run-time specifier: a bundler cannot resolve `import(msg.url)`,
 // so the built Worker chunk 404'd on a bare `./gex.mjs` and rejected where
 // nobody listened. This file and `gex.mjs` are siblings everywhere.
-import { setFill, fillFile, lazyReady } from './lazy-fetch.mjs';
+import { setFill, fillFile, lazyReady, kernelThread, lazyFetch, processMemories } from './lazy-fetch.mjs';
+import { blockIo } from './blocks.mjs';
+import { lateZstd } from './zstd-late.mjs';
 import { forkTransfer } from './fork-transfer.mjs';
 import { setLazyCache } from './lazy-cache.mjs';
-import { setPageFs } from './page-fs.mjs';
+import { pageFs, setPageFs } from './page-fs.mjs';
 // The host's clock object, looked up once in this realm: `performance` is a
 // Blink attribute of the global scope, and reading it costs more than `now()`.
 const perf = globalThis.performance;
@@ -336,6 +338,28 @@ function closureModules(n) {
   return allHere.then(() => arrived);
 }
 
+/**
+ * A process that never got a runtime (no memory could be made for it) ends
+ * in the kernel as one killed would: its status for its parent's `wait4`
+ * (a `vfork` parent's wait with it), its pipe and terminal ends let go. The
+ * global kernel is instantiated for it here on the kernel spec's spare
+ * memories, so this makes no memory of its own.
+ */
+async function endUnstarted(msg) {
+  const spec = msg.kernel, pid = msg.child?.pid ?? msg.pid;
+  if (!spec?.module || !spec.memory || !pid || !spec.spare) return;
+  const mod = spec.module instanceof WebAssembly.Module ? spec.module : await WebAssembly.compile(spec.module);
+  const inst = await WebAssembly.instantiate(mod, {
+    env: { memory: spec.memory, ...processMemories(spec.spare.m32, false, spec.spare), lazy_fetch: lazyFetch(spec.memory), block_io: blockIo(spec.memory), page_fs: pageFs(spec.memory) },
+  });
+  const k = inst.exports;
+  if (msg.kernelStack && k.__stack_pointer) kernelThread(k, msg.kernelStack);
+  if (k.k_proc_no_memory) k.k_proc_no_memory(pid);
+  else k.k_exit(pid, -9);
+  k.k_pipe_forget?.(pid);
+  k.k_pty_forget?.(pid);
+}
+
 async function handle(msg) {
   // GEX_LOG from the page (`extra.log`): a Worker sees neither its globals nor its query.
   setLog(msg?.log);
@@ -505,9 +529,9 @@ async function handle(msg) {
   if (msg.cgen?.zstd && typeof XMLHttpRequest === 'function') {
     try {
       const t0 = logNamed('unitstall') ? performance.now() : -1;
-      const { ZSTDDecoder } = await import(msg.cgen.zstd);
-      zstd = new ZSTDDecoder();
-      await zstd.init();
+      // compiled now, instantiated at its first decode: a Worker that never
+      // decodes (most threads) makes no memory for it (zstd-late.mjs)
+      zstd = await lateZstd(import(msg.cgen.zstd), new URL('./zstddec.wasm', new URL(msg.cgen.zstd, globalThis.location?.href)).href);
       if (t0 >= 0) console.warn(`[unitzstd] decoder ready in ${(performance.now() - t0).toFixed(1)} ms`);
     } catch (err) {
       console.error(`[gex] no zstd decoder for units (${msg.cgen.zstd}): ${err?.message ?? err}`);
@@ -820,7 +844,7 @@ async function handle(msg) {
   // The runtime made in the pool, when this process runs on a fresh memory
   // of its own as that one does, on the same kernel stack.
   const pre = preattached && msg.kind === 'adopt' && msg.child?.exec && !msg.memory
-    && !msg.recycledMemory && !msg.moduleStore ? await preattached : null;
+    && !msg.recycledMemory && !msg.moduleStore ? await preattached.catch(() => null) : null;
   // Made for an exec'd child and taken by something else: its memory is
   // dropped unused, and stays committed until this Worker's isolate collects
   // (host.mjs `#preattach`; a test counts these).
@@ -836,7 +860,9 @@ async function handle(msg) {
   }
   // Back to the process's own type, should the pool's have been the other.
   if (pre && pre.mem64 && !msg.mem64 && !(SP_CODE && single.on)) delete globalThis.GEX_MEM64;
-  const gex = fits
+  let gex;
+  try {
+  gex = fits
     ? pre.gex
     : new Gex(new WorkerEnv(), {
       kernel: msg.kernel ? { ...msg.kernel, stackTop: msg.kernelStack } : null,
@@ -851,6 +877,13 @@ async function handle(msg) {
       fiber: rawPort.fiber ?? null,
       mem64: !!msg.mem64,
     });
+  } catch (e) {
+    // No memory for the process (`wasmMemory`: the tab holds as many as it
+    // can): it ends as a crash, said plainly (handle's caller), and the
+    // kernel hears of it here, since there is no runtime to say it.
+    if (!msg.memory) await endUnstarted(msg).catch((err) => console.error(`[gex] pid ${msg.child?.pid ?? msg.pid ?? '?'}: its end was not recorded: ${err?.message ?? err}`));
+    throw e;
+  }
   if (gex === pre?.gex) gex.setEnv(new WorkerEnv());
   // Module-scope, so a `sharedModule` message (which arrives outside this
   // handler's run/adopt/thread path) can reach this Worker's runtime.
@@ -1597,7 +1630,7 @@ async function handle(msg) {
       stack: e?.stack ?? '',
     });
     // The trap abandoned this instance's stack; its slot is free for the next.
-    gex?.releaseWorker?.();
+    gex?.releaseWorker?.(true);
   }
 }
 

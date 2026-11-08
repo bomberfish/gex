@@ -1361,8 +1361,9 @@ pub extern "C" fn gex_wasmdll_thunks(number: u32, buf: u32, cap: u32) -> u32 {
 /// A module of thunks for calls into a module not yet installed (`L`): its
 /// function `k` (exported as `k`) calls `slots[k]`'s table entry, with
 /// `call_indirect` once the Worker has filled it (its flag set: byte
-/// `r.b + k` of the Worker's flag store, the memory `r.m`), else JS's
-/// import `s.k`, which catches up first. In wasm, so a
+/// `r.b + k` of the Worker's flags for this module, in the process memory
+/// `r.m`, from the shim's heap), else JS's import `s.k`, which catches up
+/// first. In wasm, so a
 /// call through it keeps no JS frame below the callee: the single-thread
 /// build suspends the whole stack at a blocking call, which a JS frame
 /// would refuse.
@@ -1388,9 +1389,14 @@ fn late_thunks(slots: &[(wasmparser::FuncType, u32)]) -> Vec<u8> {
         types.ty().function(ty.params().iter().map(vt), ty.results().iter().map(vt));
         imports.import("s", &k.to_string(), we::EntityType::Function(k as u32));
     }
-    // the Worker's ready flags, a byte each, this module's from `r.b` on
-    imports.import("r", "m", we::MemoryType { minimum: 1, maximum: None, memory64: false, shared: false, page_size_log2: None });
-    imports.import("r", "b", we::GlobalType { val_type: we::ValType::I32, mutable: false, shared: false });
+    // the Worker's ready flags, a byte each from `r.b`, in the process
+    // memory: its type as the page makes it (a shared memory's maximum is
+    // part of its type; this one admits the page's, 4 GiB less a page or
+    // 16 GiB, and any smaller)
+    let shared = cfg!(feature = "shared-memory");
+    let maximum = if t64 { Some(gex_abi::LIMIT64_PAGES) } else if shared { Some(1 << 16) } else { None };
+    imports.import("r", "m", we::MemoryType { minimum: 0, maximum, memory64: t64, shared, page_size_log2: None });
+    imports.import("r", "b", we::GlobalType { val_type: if t64 { we::ValType::I64 } else { we::ValType::I32 }, mutable: false, shared: false });
     for (k, (ty, slot)) in slots.iter().enumerate() {
         let k = k as u32;
         funcs.function(k);

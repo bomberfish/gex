@@ -9702,6 +9702,10 @@ impl Kernel {
     /// when no WINEGEX_IMAGE names it): an x86-64 one that cannot be
     /// loaded anywhere but above the lowered memory's code space
     /// ([`pe_needs_mem64`]) asks for a 64-bit memory.
+    ///
+    /// The exec of a Gecko program ([`pe_is_gecko`]) also gets Gecko's
+    /// switches that start its children without the sandbox
+    /// ([`gecko_without_sandbox`]).
     pub fn exec_flavour(&self, path: &str, argv: &[String], envp: &mut Vec<String>) -> Option<bool> {
         let mut flag = None;
         let mut image = None;
@@ -9724,6 +9728,17 @@ impl Kernel {
             }
             false
         });
+        // A Gecko program (Wine's loader on its .exe): its children start
+        // without the sandbox (gecko_without_sandbox).
+        if wine || image.is_some() {
+            let image = image.as_deref().or(by_hand.as_deref()).unwrap_or(path);
+            if let Some(head) = self.read_head(image, 4096) {
+                let dir = image.rsplit_once('/').map_or(".", |(d, _)| d);
+                if pe_is_gecko(&head, |name: &str| self.vfs.metadata(&format!("{dir}/{name}")).is_ok()) {
+                    gecko_without_sandbox(envp);
+                }
+            }
+        }
         flag.or_else(|| {
             let mut b = [0u8; 8];
             let op = crate::vfs::XattrOp::Get { name: "user.gex.mem64", buf: &mut b };
@@ -17554,6 +17569,37 @@ mod tests {
 /// virtual.c `w64_code_space_limit`).
 pub const W64_CODE_TOP: u64 = 0x7fff_0000;
 
+/// Whether `head` starts an x86-64 PE32+ image's headers.
+fn pe_x64(head: &[u8]) -> bool {
+    let u16_at = |o: usize| head.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+    let nt = head.get(0x3c..0x40).map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize);
+    head.get(..2) == Some(b"MZ")
+        && nt.is_some_and(|nt| head.get(nt..nt + 4) == Some(b"PE\0\0") && u16_at(nt + 4) == Some(0x8664) && u16_at(nt + 24) == Some(0x20b))
+}
+
+/// Whether the image whose headers start `head` is an x86-64 Gecko
+/// program's (Firefox, Thunderbird): `beside` says its directory has
+/// mozglue.dll.
+pub fn pe_is_gecko(head: &[u8], beside: impl Fn(&str) -> bool) -> bool {
+    pe_x64(head) && beside("mozglue.dll")
+}
+
+/// Gecko's switches that start its child processes without Chromium's
+/// sandbox, each added to `envp` unless it already sets it (so a user
+/// can still ask for the sandbox). Wine enforces no token or job, so the
+/// sandbox protects nothing here; and to set it up, the parent patches
+/// each child's ntdll through Chromium's interceptions, which accept only
+/// the Windows system call stub at an Nt export, not the PE skeleton's
+/// stub (`skel`), so it killed every child it started.
+pub fn gecko_without_sandbox(envp: &mut Vec<String>) {
+    for kind in ["CONTENT", "GPU", "RDD", "SOCKET_PROCESS", "GMP", "UTILITY"] {
+        let name = format!("MOZ_DISABLE_{kind}_SANDBOX=");
+        if !envp.iter().any(|e| e.starts_with(&name)) {
+            envp.push(format!("{name}1"));
+        }
+    }
+}
+
 /// Whether the PE image whose headers start `head` is an x86-64 one that
 /// only a 64-bit memory can load: it has no relocations (stripped, or no
 /// relocation directory), so it goes at its preferred base alone, and that
@@ -17587,7 +17633,7 @@ pub fn pe_needs_mem64(head: &[u8], beside: impl Fn(&str) -> bool) -> bool {
         let dirs = u32_at(opt + 108)?;
         let relocs = if dirs > 5 { u32_at(opt + 112 + 5 * 8 + 4)? } else { 0 };
         let fixed = chars & 1 != 0 || relocs == 0;
-        let gecko = beside("mozglue.dll");
+        let gecko = pe_is_gecko(head, &beside);
         let java = ["server/jvm.dll", "client/jvm.dll", "jvm.dll"].into_iter().any(&beside);
         Some((fixed && base.saturating_add(size) > W64_CODE_TOP) || gecko || java)
     };
@@ -17623,6 +17669,22 @@ mod pe_mem64_tests {
         // A Java launcher: the VM in bin\server\ (a JDK's or a JRE's), or beside it.
         assert!(pe_needs_mem64(&pe(0x1_4000_0000, 0x22, 0x200, 0x8664), |n| n == "server/jvm.dll"));
         assert!(pe_needs_mem64(&pe(0x1_4000_0000, 0x22, 0x200, 0x8664), |n| n == "jvm.dll"));
+    }
+
+    #[test]
+    fn gecko_children_start_without_the_sandbox() {
+        use super::{gecko_without_sandbox, pe_is_gecko};
+        let exe = pe(0x1_4000_0000, 0x22, 0x200, 0x8664);
+        assert!(pe_is_gecko(&exe, |n| n == "mozglue.dll"));
+        assert!(!pe_is_gecko(&exe, |_| false));
+        assert!(!pe_is_gecko(&pe(0x40_0000, 0x22, 0x200, 0x14c), |n| n == "mozglue.dll"));
+        let mut env = vec!["PATH=/bin".to_string(), "MOZ_DISABLE_GPU_SANDBOX=0".to_string()];
+        gecko_without_sandbox(&mut env);
+        assert!(env.contains(&"MOZ_DISABLE_CONTENT_SANDBOX=1".to_string()));
+        assert!(env.contains(&"MOZ_DISABLE_UTILITY_SANDBOX=1".to_string()));
+        // the user's own setting stays
+        assert_eq!(env.iter().filter(|e| e.starts_with("MOZ_DISABLE_GPU_SANDBOX=")).collect::<Vec<_>>(), ["MOZ_DISABLE_GPU_SANDBOX=0"]);
+        assert_eq!(env.len(), 7);
     }
 
     #[test]

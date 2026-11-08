@@ -3381,7 +3381,8 @@ fn wine32_note_reach(to: u64, why: &str, start: u64, end: u64) {
     if SAID.fetch_max(step, std::sync::atomic::Ordering::Relaxed) >= step {
         return;
     }
-    warn_line(&format!(
+    // Growth, not a fault: debug output (GEX_LOG=debug), not the default log.
+    trace_line(&format!(
         "gex: wine32 pid {}: memory reaches {} MiB for {why} [{start:#x}, {end:#x}); arena cursor {:#x}, highest arena span end {:#x}\n",
         my_pid(),
         to >> 20,

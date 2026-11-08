@@ -29,6 +29,9 @@
 //   GEX_LOG=traps        per process at its end, how its Worker's traps went on:
 //                        straight on (`gex_after_trap`) or through each step
 //                        (only when named)
+//   GEX_LOG=mem          a line per wasm memory the tab makes or lets go, with
+//                        how many it holds (lazy-fetch.mjs `wasmMemory`; a
+//                        tab holds about 124) (only when named)
 //   GEX_LOG=a,b          several of those
 //   GEX_LOG=quiet        the default lines but the routine ones: no line per
 //                        process started or library loaded; errors and rare

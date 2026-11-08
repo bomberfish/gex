@@ -16,6 +16,8 @@ export default async function (t) {
     for (const m of r.out.matchAll(/^     (image base|page) (\S+)/gm)) t.say(`${name}: ${m[1]} ${m[2]}`);
     t.check(`${name}, peerhigh`, /^peerhigh done, 0 failed/m.test(r.out), w.detail(r, 4));
   };
-  leg('page', await w.page(['/t/peerhigh.exe'], { files: { '/t/peerhigh.exe': exe }, timeout: 300000 }));
+  // 600 s: the twin's first start compiles its memory64 modules, which
+  // took over 300 s under a full gate's load (about 270 s alone)
+  leg('page', await w.page(['/t/peerhigh.exe'], { files: { '/t/peerhigh.exe': exe }, timeout: 600000 }));
   w.clean();
 }

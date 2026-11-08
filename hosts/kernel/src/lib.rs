@@ -1741,6 +1741,14 @@ pub extern "C" fn k_exit(pid: i32, status: i32) {
     procs().exit_code(pid, status);
 }
 
+/// Process `pid` never ran: the page could make no memory for it (a tab
+/// holds only so many). It ends as one killed, a crash that says why.
+#[no_mangle]
+pub extern "C" fn k_proc_no_memory(pid: i32) {
+    procs().set_crash(pid, b"\0the tab can hold no more process memories\0");
+    k_exit(pid, -9);
+}
+
 /// Collect a finished child of `ppid`. Zero if none is ready. `want` is a
 /// specific pid, or -1 for any. `nowait` non-zero (`waitid`'s `WNOWAIT`)
 /// reports the child without collecting it.

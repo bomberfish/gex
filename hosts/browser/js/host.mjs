@@ -26,7 +26,7 @@ function narrate(text) {
 import { single } from './single.mjs';
 import { SP_CODE } from './mode.mjs';
 import { forkTransfer } from './fork-transfer.mjs';
-import { HELPER_STACK_COUNT } from './lazy-fetch.mjs';
+import { HELPER_STACK_COUNT, wasmMemory } from './lazy-fetch.mjs';
 import { logNamed, logOn, logQuiet, logRoutine } from './log.mjs';
 import { XC_STOP, xcBusy, xcGate, xcSleep } from './xcache.mjs';
 // The host's clock object, looked up once in this realm: `performance` is a
@@ -1045,7 +1045,7 @@ export class ProcessHost {
     const order = [...byPid].sort(([a], [b]) => (b === meta.door?.pid) - (a === meta.door?.pid));
     for (const [pid, ts] of order) {
       const bytes = memories.get(pid);
-      const memory = new WebAssembly.Memory({ initial: snapLength(bytes) / 65536, maximum: meta.maxPages[pid], shared: true });
+      const memory = wasmMemory({ initial: snapLength(bytes) / 65536, maximum: meta.maxPages[pid], shared: true }, 'a restored process memory', this.#kernel?.spare);
       snapFill(memory, bytes);
       let moduleStore;
       const sb = stores.get(pid);

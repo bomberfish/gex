@@ -5,7 +5,7 @@
 // it may ask while the page's terminal does. fs-opened.js asks
 // one at a time, so two of these never share it.
 
-import { helperStackTop, kernelThread, lazyFetch, processMemories } from '../../hosts/browser/js/lazy-fetch.mjs';
+import { helperStackTop, kernelThread, lazyFetch, processMemories, wasmMemory } from '../../hosts/browser/js/lazy-fetch.mjs';
 import { blockIo } from '../../hosts/browser/js/blocks.mjs';
 import { pageFs } from '../../hosts/browser/js/page-fs.mjs';
 
@@ -16,7 +16,7 @@ self.onmessage = async (e) => {
     let inst, mem;
     // The process memory as the kernel build declares it (shared or not).
     for (const shared of [true, false]) {
-      mem = new WebAssembly.Memory({ initial: 1, maximum: 65535, shared });
+      mem = wasmMemory({ initial: 1, maximum: 65535, shared }, 'the open-files scratch memory');
       try {
         inst = await WebAssembly.instantiate(e.data.module, { env: { memory: e.data.memory, ...processMemories(mem), lazy_fetch: lazyFetch(e.data.memory), block_io: blockIo(e.data.memory), page_fs: pageFs(e.data.memory) } });
         break;
