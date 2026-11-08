@@ -98,6 +98,7 @@ pub fn header() -> String {
         ("X87_TAGS", ctx::X87_TAGS),
         ("X87_TMP", ctx::X87_TMP),
         ("SCRATCH", ctx::SCRATCH),
+        ("SYSCALL_IMM", ctx::SYSCALL_IMM),
         ("SIZE", ctx::SIZE),
     ];
     for (name, off) in offs {

@@ -131,7 +131,7 @@ mod tests {
     }
 
     /// Build a fetch closure over a slice of instruction words at `base`.
-    fn words(base: u64, code: &'static [u32]) -> impl Fn(u64) -> Option<u32> {
+    fn words<'a>(base: u64, code: &'a [u32]) -> impl Fn(u64) -> Option<u32> + 'a {
         move |pc| {
             if pc < base {
                 return None;
@@ -202,6 +202,133 @@ mod tests {
     fn unfetchable_address_becomes_illegal() {
         let b = lift_block(|_| None, 0x5000, BlockLimits::default());
         assert_eq!(b.term, Term::Illegal { raw: 0, pc: 0x5000 });
+    }
+
+    /// Run a lifted block as a one-block memory-form function in gex-ir's
+    /// reference interpreter, starting from `regs` (indexed by
+    /// [`reg_index`]); returns the run's register file.
+    fn run_block(b: &gex_ir::Block, regs: Vec<u64>) -> Vec<u64> {
+        use gex_ir::func::{FBlock, FTerm, Form, Function};
+        use gex_ir::{interp, ssa::CallEffect, GuestReg, Term};
+        let f = Function {
+            entry: b.start,
+            name: None,
+            entries: vec![],
+            blocks: vec![FBlock {
+                start: b.start,
+                end: b.end,
+                synthetic: false,
+                params: vec![],
+                stmts: b.stmts.clone(),
+                pcs: vec![b.start; b.stmts.len()],
+                insts: (b.start..b.end).step_by(4).collect(),
+                term: match &b.term {
+                    Term::Indirect { target, is_ret: true } => FTerm::Return { target: *target },
+                    other => panic!("the test block must end in ret, got {other:?}"),
+                },
+                term_pc: b.end,
+            }],
+            n_values: b.n_values,
+            form: Form::Memory,
+        };
+        let m = interp::Model {
+            call: &|_| CallEffect::UNKNOWN,
+            sp: GuestReg::Sp,
+            max_steps: 100,
+            syscall: None,
+            narrow: false,
+        };
+        let out = interp::run_from(&f, 0, regs, &m);
+        assert!(
+            matches!(out.stop, interp::Stop::Return(_)),
+            "the run stopped at {:?}",
+            out.stop
+        );
+        out.regs
+    }
+
+    /// The CRC32 / CRC32C expansion: known-answer vectors ("123456789") and
+    /// a plain reference bit loop over a few inputs.
+    #[test]
+    fn crc32_expansion_matches_the_architecture() {
+        use gex_ir::func::{reg_index, N_REGS};
+        use gex_ir::{interp, GuestReg};
+
+        // The reference: the same reflected bit loop the expansion is
+        // written from, but plainly.
+        fn crc_ref(mut acc: u32, src: u64, nbytes: u32, poly: u32) -> u32 {
+            for i in 0..nbytes {
+                acc ^= ((src >> (8 * i)) & 0xff) as u32;
+                for _ in 0..8 {
+                    acc = (acc >> 1) ^ (poly & 0u32.wrapping_sub(acc & 1));
+                }
+            }
+            acc
+        }
+        const IEEE: u32 = 0xedb8_8320; // 0x04C11DB7 reversed
+        const CASTAGNOLI: u32 = 0x82f6_3b78; // 0x1EDC6F41 reversed
+
+        // crc32x w0, w0, x1 ; crc32b w0, w0, w2 ; ret -- the nine bytes of
+        // "123456789" through the widest form and then the last byte.
+        let run = |word_x: u32, word_b: u32, acc: u32, src: u64, last: u32| -> u32 {            let b = lift_block(
+                words(0x6000, &[word_x, word_b, 0xd65f03c0]),
+                0x6000,
+                BlockLimits::default(),
+            );
+            let mut regs = interp::initial_regs(0, GuestReg::Sp);
+            assert_eq!(regs.len(), N_REGS);
+            regs[reg_index(GuestReg::X(0))] = acc as u64;
+            regs[reg_index(GuestReg::X(1))] = src;
+            regs[reg_index(GuestReg::X(2))] = last as u64;
+            run_block(&b, regs)[reg_index(GuestReg::X(0))] as u32
+        };
+        // "12345678" little-endian in x1, '9' = 0x39 in x2.
+        let s = u64::from_le_bytes(*b"12345678");
+        // CRC-32/ISO-HDLC of "123456789" is 0xCBF43926 with init and xorout
+        // 0xFFFFFFFF: from a 0xFFFFFFFF running CRC, the instruction's form
+        // ends at the check value xored with 0xFFFFFFFF.
+        assert_eq!(
+            run(0x9ac14c00, 0x1ac24000, 0xffff_ffff, s, 0x39),
+            0xcbf4_3926 ^ 0xffff_ffff,
+            "crc32x + crc32b"
+        );
+        // CRC-32/ISCSI (Castagnoli) of "123456789" is 0xE3069283.
+        assert_eq!(
+            run(0x9ac15c00, 0x1ac25000, 0xffff_ffff, s, 0x39),
+            0xe306_9283 ^ 0xffff_ffff,
+            "crc32cx + crc32cb"
+        );
+
+        // The other widths against the reference: halfwords and words take
+        // the low 2/4 bytes of their source only, and each form's byte count
+        // is its own.
+        for (word, nbytes, poly) in [
+            (0x1ac14000u32, 1, IEEE),        // crc32b w0, w0, w1
+            (0x1ac14400, 2, IEEE),           // crc32h
+            (0x1ac14800, 4, IEEE),           // crc32w
+            (0x9ac14c00, 8, IEEE),           // crc32x
+            (0x1ac15000, 1, CASTAGNOLI),     // crc32cb
+            (0x1ac15400, 2, CASTAGNOLI),     // crc32ch
+            (0x1ac15800, 4, CASTAGNOLI),     // crc32cw
+            (0x9ac15c00, 8, CASTAGNOLI),     // crc32cx
+        ] {
+            for (acc, src) in [(0u32, 0u64), (0xffff_ffff, 0x0123_4567_89ab_cdef), (0x1234_5678, u64::MAX)] {
+                let b = lift_block(
+                    words(0x6000, &[word, 0xd65f03c0]),
+                    0x6000,
+                    BlockLimits::default(),
+                );
+                let mut regs = interp::initial_regs(0, GuestReg::Sp);
+                regs[reg_index(GuestReg::X(0))] = acc as u64;
+                regs[reg_index(GuestReg::X(1))] = src;
+                let got = run_block(&b, regs)[reg_index(GuestReg::X(0))] as u32;
+                assert_eq!(
+                    got,
+                    crc_ref(acc, src, nbytes, poly),
+                    "word {word:#010x} of {nbytes} byte(s), acc {acc:#010x}, src {src:#018x}"
+                );
+            }
+        }
     }
 
     #[test]

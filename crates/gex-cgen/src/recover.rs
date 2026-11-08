@@ -144,7 +144,7 @@ fn form(entry: u64, by_addr: &HashMap<u64, &Block>, entries: &BTreeSet<u64>) -> 
                     FTerm::Unresolved { target: t }
                 }
             }
-            Term::Syscall { next } => {
+            Term::Syscall { next, imm } => {
                 let e = if by_addr.contains_key(next) && !(entries.contains(next) && *next != entry) {
                     Some(Edge::to(id_of(*next, &mut ids, &mut order, &mut work)))
                 } else {
@@ -153,6 +153,7 @@ fn form(entry: u64, by_addr: &HashMap<u64, &Block>, entries: &BTreeSet<u64>) -> 
                 FTerm::Syscall {
                     next_pc: *next,
                     next: e,
+                    imm: *imm,
                 }
             }
             Term::Illegal { raw, pc } => FTerm::Illegal { raw: *raw, pc: *pc },

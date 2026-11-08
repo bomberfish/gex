@@ -187,7 +187,7 @@ pub fn describe(b: &gex_ir::Block) -> (u32, u64, u64) {
             0,
             aux_call,
         ),
-        Term::Syscall { next } => (flags::TERM_SYSCALL | call, next, aux_call),
+        Term::Syscall { next, .. } => (flags::TERM_SYSCALL | call, next, aux_call),
         Term::Illegal { .. } => (flags::TERM_ILLEGAL | call, 0, aux_call),
     }
 }

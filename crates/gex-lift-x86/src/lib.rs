@@ -766,7 +766,7 @@ impl<'a> Lifter<'a> {
             // number and arguments from the 32-bit registers when the process
             // is a 32-bit one. Any other software interrupt is a fault.
             Op::Int if i.ops[0] == Some(Operand::Imm(0x80)) && self.wa() == Width::D => {
-                Flow::End(Term::Syscall { next })
+                Flow::End(Term::Syscall { next, imm: 0 })
             }
             // A privileged instruction in user mode (hlt, cli/sti, in/out,
             // ins/outs), and a software interrupt through a gate user code
@@ -1487,7 +1487,7 @@ impl<'a> Lifter<'a> {
                 self.wr64(RCX, n);
                 let fl = self.k64(0x246);
                 self.wr64(R11, fl);
-                Flow::End(Term::Syscall { next })
+                Flow::End(Term::Syscall { next, imm: 0 })
             }
             // `int $3` (cd 03) is a breakpoint like int3; its gate is open
             // to user code.

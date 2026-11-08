@@ -1604,6 +1604,36 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
                 reg(rn, Sz::X)
             )
         }
+        Inst::CompareSwapPair {
+            sz,
+            rs,
+            rt,
+            rn,
+            acquire,
+            release,
+        } => {
+            let suffix = match (acquire, release) {
+                (false, false) => "",
+                (true, false) => "a",
+                (false, true) => "l",
+                (true, true) => "al",
+            };
+            let rsz = if sz == MemSz::D { Sz::X } else { Sz::W };
+            // The second register of each pair is the base + 1 (the
+            // encoding keeps both bases even).
+            let next = |r: RegSel| match r {
+                RegSel::Gp(n) => RegSel::gp(n as u32 + 1),
+                other => other,
+            };
+            format!(
+                "casp{suffix} {}, {}, {}, {}, [{}]",
+                reg(rs, rsz),
+                reg(next(rs), rsz),
+                reg(rt, rsz),
+                reg(next(rt), rsz),
+                reg(rn, Sz::X)
+            )
+        }
         Inst::AtomicRmw {
             sz,
             op,

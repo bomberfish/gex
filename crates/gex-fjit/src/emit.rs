@@ -1427,9 +1427,10 @@ impl E<'_, '_> {
                 self.tail_through_table(Target::Op(val()));
             }
             FTerm::Unresolved { .. } => self.leave_value(val()),
-            FTerm::Syscall { next_pc, next } => {
+            FTerm::Syscall { next_pc, next, imm } => {
                 self.flush(RegSet::ALL, false);
                 self.b.store_pc(*next_pc);
+                self.b.store_syscall_imm(*imm);
                 let sc = self.m.cx.syscall;
                 let fb = self.b.f();
                 fb.local_get(0);

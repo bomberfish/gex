@@ -204,8 +204,14 @@ pub enum FTerm {
     Unresolved { target: Value },
     /// Enter the kernel. `next` is `None` when the syscall is known not to
     /// return (`exit`, `exit_group`); as with calls, a backend still handles
-    /// an unexpected return by leaving to `next_pc`.
-    Syscall { next_pc: u64, next: Option<Edge> },
+    /// an unexpected return by leaving to `next_pc`. `imm` is the
+    /// system-call number when the ISA encodes it in the instruction (see
+    /// [`Term::Syscall`]); 0 when it comes from a register.
+    Syscall {
+        next_pc: u64,
+        next: Option<Edge>,
+        imm: u32,
+    },
     /// An instruction gex cannot execute: raises SIGILL.
     Illegal { raw: u32, pc: u64 },
 }

@@ -1988,9 +1988,12 @@ impl<'a> Emitter<'a> {
                 }
                 self.dispatch("tgt");
             }
-            Term::Syscall { next } => {
+            Term::Syscall { next, imm } => {
                 self.flush();
                 self.store_pc(&format!("0x{next:x}ull"));
+                if imm != 0 {
+                    self.line(format!("GEX_C64(GEX_CTX_SYSCALL_IMM) = {imm}ull;"));
+                }
                 let at = block.end - gex_abi::SYSCALL_INST_BYTES;
                 self.line(format!("gex_syscall(ctx, 0x{at:x}ll);"));
                 self.invalidate();

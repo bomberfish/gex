@@ -509,6 +509,11 @@ impl<'a> FnBody<'a> {
         self.e.store_pc(pc);
     }
 
+    /// [`Context::store_syscall_imm`](super::Context::store_syscall_imm).
+    pub fn store_syscall_imm(&mut self, imm: u32) {
+        self.e.store_syscall_imm(imm);
+    }
+
     /// tier-1's safepoint countdown (the context's counter), polling with
     /// `pc`. Writes nothing back: the caller flushes first if it must.
     pub fn safepoint(&mut self, pc: u64) {

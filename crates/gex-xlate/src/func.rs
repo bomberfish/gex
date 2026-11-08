@@ -512,6 +512,7 @@ enum DTerm {
     Syscall {
         next_pc: u64,
         next: Option<Tgt>,
+        imm: u32,
     },
     Illegal {
         raw: u32,
@@ -700,8 +701,12 @@ fn discover(
                 }
                 None => DTerm::Indirect(target),
             },
-            (Term::Syscall { next }, _) => {
-                let never = syscall_number(&l).is_some_and(arch::syscall_never_returns);
+            (Term::Syscall { next, imm }, _) => {
+                // The never-returns analysis reads a *register* number (the
+                // Linux shape); an immediate-numbered call (an
+                // `svc #imm`) leaves `x8` free to hold anything, so a fold of
+                // it must not decide this call does not return.
+                let never = imm == 0 && syscall_number(&l).is_some_and(arch::syscall_never_returns);
                 DTerm::Syscall {
                     next_pc: next,
                     next: if never {
@@ -709,6 +714,7 @@ fn discover(
                     } else {
                         Some(internal(classify(next), &mut succ))
                     },
+                    imm,
                 }
             }
             (Term::Illegal { raw, pc }, _) => DTerm::Illegal { raw: raw, pc: pc },
@@ -850,9 +856,10 @@ fn assemble(start: u64, name: Option<String>, drafts: &BTreeMap<u64, Draft>, ent
                 cases: cases.iter().map(|&(a, t)| (a, edge(t, &mut exits))).collect(),
                 table: table.clone(),
             },
-            DTerm::Syscall { next_pc, next } => FTerm::Syscall {
+            DTerm::Syscall { next_pc, next, imm } => FTerm::Syscall {
                 next_pc: *next_pc,
                 next: next.map(|t| edge(t, &mut exits)),
+                imm: *imm,
             },
             DTerm::Illegal { raw, pc } => FTerm::Illegal { raw: *raw, pc: *pc },
         };

@@ -1265,8 +1265,11 @@ pub enum Term {
         /// True for `ret`, which the backend may serve from a return cache.
         is_ret: bool,
     },
-    /// Enter the kernel, then continue at `next`.
-    Syscall { next: u64 },
+    /// Enter the kernel, then continue at `next`. `imm` is the system-call
+    /// number when the ISA encodes it in the instruction itself (an AArch64
+    /// `svc #imm`); 0 when the number comes from a register
+    /// ([`crate::ctx::SYSCALL_NR`]).
+    Syscall { next: u64, imm: u32 },
     /// An instruction we cannot execute. Raises SIGILL and does not return.
     Illegal { raw: u32, pc: u64 },
 }
@@ -1329,7 +1332,7 @@ impl Block {
                 out.push(taken);
                 out.push(not_taken);
             }
-            Term::Syscall { next } => out.push(next),
+            Term::Syscall { next, .. } => out.push(next),
             Term::Indirect { .. } | Term::Illegal { .. } => {}
         }
         out.into_iter()

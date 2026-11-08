@@ -328,9 +328,40 @@ fn decode_branch_sys(raw: u32, pc: u64) -> Inst {
         if op2 != 0b11111 {
             return Inst::Unknown { raw };
         }
-        // op3 != 0 selects the pointer-authentication variants (BRAA etc).
+        // op3 != 0 selects the pointer-authentication variants. gex never
+        // produces or checks a PAC (see the PAC hints in `decode_system`),
+        // so each form is its plain branch with the authentication dropped.
+        // op3 000010/000011 choose key A/B; bit 24 picks the zero-modifier
+        // Z forms (op4 11111) from the register-modifier ones (op4 names
+        // the modifier register, 31 meaning sp).
         if op3 != 0 {
-            return Inst::Unknown { raw };
+            if op3 != 0b000010 && op3 != 0b000011 {
+                return Inst::Unknown { raw };
+            }
+            if bit(raw, 24) == 0 && op4 != 0b11111 {
+                return Inst::Unknown { raw };
+            }
+            return match bits(raw, 23, 21) {
+                // BRAAZ / BRAA.
+                0b000 => Inst::BranchReg {
+                    rn: RegSel::gp(rn),
+                    link: false,
+                    is_ret: false,
+                },
+                // BLRAAZ / BLRAA.
+                0b001 => Inst::BranchReg {
+                    rn: RegSel::gp(rn),
+                    link: true,
+                    is_ret: false,
+                },
+                // RETAA / RETAB: x30, zero-modifier form only.
+                0b010 if bit(raw, 24) == 0 && rn == 0b11111 => Inst::BranchReg {
+                    rn: RegSel::gp(30),
+                    link: false,
+                    is_ret: true,
+                },
+                _ => Inst::Unknown { raw },
+            };
         }
         return match (opc, op4) {
             (0b0000, 0) => Inst::BranchReg {
@@ -609,7 +640,25 @@ fn decode_dp_reg(raw: u32) -> Inst {
         0b1101_0110 => {
             if bit(raw, 30) == 1 {
                 // 1 source: opcode2 in [20:16], opcode in [15:10].
-                if bit(raw, 29) != 0 || rm != 0 {
+                if bit(raw, 29) != 0 {
+                    return Inst::Undefined { raw };
+                }
+                // FEAT_PAuth's PAC/AUT/XPAC (opcode2 00001, the only other
+                // opcode2 in this space): insert, check or strip the
+                // signature gex never produces or checks (see the PAC hints
+                // in decode_system), so each is a no-op. Opcode 000xxx
+                // signs or authenticates Xd with modifier Xn (Rn 31 = sp);
+                // 001xxx is the zero-modifier Z form (Rn must be 31);
+                // 01000x is XPACI/XPACD, which strips the signature again.
+                if rm == 0b00001 && sf == 1 {
+                    return match (bits(raw, 15, 10), rn) {
+                        (0b000000..=0b000111, _) => Inst::Hint { imm: 0 },
+                        (0b001000..=0b001111, 0b11111) => Inst::Hint { imm: 0 },
+                        (0b010000, 0b11111) | (0b010001, 0b11111) => Inst::Hint { imm: 0 },
+                        _ => Inst::Unknown { raw },
+                    };
+                }
+                if rm != 0 {
                     return Inst::Undefined { raw };
                 }
                 let op = match bits(raw, 15, 10) {
@@ -636,6 +685,21 @@ fn decode_dp_reg(raw: u32) -> Inst {
             } else {
                 if bit(raw, 29) != 0 {
                     return Inst::Undefined { raw };
+                }
+                // PACGA (FEAT_PAuth): the PAC of Xn with modifier Xm (31 =
+                // sp) under the generic key, written to Xd[63:32] with
+                // Xd[31:0] zero. The key is a per-process secret, so code
+                // can only recompute a PAC and compare it with one it
+                // computed earlier; a constant zero keeps every such
+                // comparison true.
+                if bits(raw, 15, 10) == 0b001100 && sf == 1 {
+                    return Inst::MoveWide {
+                        sz: Sz::X,
+                        op: MoveOp::Movz,
+                        rd: RegSel::gp(rd),
+                        imm16: 0,
+                        shift: 0,
+                    };
                 }
                 let op = match bits(raw, 15, 10) {
                     0b000010 => Dp2Op::Udiv,
@@ -701,6 +765,34 @@ fn decode_dp_reg(raw: u32) -> Inst {
 // ---------------------------------------------------------------------------
 
 fn decode_load_store(raw: u32, pc: u64) -> Inst {
+    // LDAPR/LDAPRB/LDAPRH (FEAT_LRCPC): a load-acquire RCpc from [Rn].
+    // Ordering::Acquire is stronger than RCpc, hence safe.
+    if (raw & 0x3FFF_FC00) == 0x38BF_C000 {
+        let size = bits(raw, 31, 30);
+        return Inst::Load {
+            sz: MemSz::from_log2(size),
+            dest: if size == 0b11 { Sz::X } else { Sz::W },
+            signed: false,
+            rt: RegSel::gp(bits(raw, 4, 0)),
+            addr: AddrMode::Offset {
+                rn: RegSel::sp(bits(raw, 9, 5)),
+                off: 0,
+            },
+            order: Ordering::Acquire,
+        };
+    }
+    // FEAT_MTE's allocation-tag stores: STG/STZG/ST2G/STZ2G (any addressing
+    // mode) and the STZGM/STGM whole-block forms. The tag they store lives
+    // beside memory this world does not have, so every one is a no-op. The
+    // tag *loads* (LDG/LDGM) are left out: they write a register.
+    if bits(raw, 31, 24) == 0b1101_1001 && bit(raw, 21) == 1 {
+        if bits(raw, 11, 10) != 0b00 {
+            return Inst::Hint { imm: 0 };
+        }
+        if raw & 0xFFFF_FC00 == 0xD920_0000 || raw & 0xFFFF_FC00 == 0xD9A0_0000 {
+            return Inst::Hint { imm: 0 };
+        }
+    }
     // Load/store exclusive: size 001000 o2 L o1 Rs o0 Rt2 Rn Rt
     if bits(raw, 29, 24) == 0b001000 {
         return decode_ldst_exclusive(raw);
@@ -1232,9 +1324,30 @@ fn decode_ldst_exclusive(raw: u32) -> Inst {
                 }
             }
         }
-        // Exclusive pair (LDXP/STXP) and CASP — deferred to the threading
-        // milestone; nothing in T0/T1 userspace emits them.
-        (0, 1) => Inst::Unknown { raw },
+        // CASP/CASPA/CASPL/CASPAL (FEAT_LSE): a pair compare-and-swap. The
+        // compare pair Rs:Rs+1 receives the pair read from memory; the swap
+        // pair Rt:Rt+1 is written when it matches. Both pair base registers
+        // are even (the decode rule), and bits[14:10] are fixed 11111. bit
+        // 31 separates the pair CAS from LDXP/STXP in this space, which
+        // stay deferred to the threading milestone.
+        (0, 1) => {
+            if bit(raw, 31) == 1 || bits(raw, 14, 10) != 0b11111 {
+                return Inst::Unknown { raw };
+            }
+            let rs = bits(raw, 20, 16);
+            let rt = bits(raw, 4, 0);
+            if rs % 2 == 1 || rt % 2 == 1 {
+                return Inst::Undefined { raw };
+            }
+            Inst::CompareSwapPair {
+                sz: if bit(raw, 30) == 1 { MemSz::D } else { MemSz::W },
+                rs: RegSel::gp(rs),
+                rt: RegSel::gp(rt),
+                rn: RegSel::sp(rn),
+                acquire: l == 1,
+                release: o0 == 1,
+            }
+        }
         // Load-acquire / store-release register — ordered but not exclusive.
         // Covers LDAR/STLR (o0=1) and LDLAR/STLLR (o0=0, FEAT_LOR); treating
         // the LOR forms as full acquire/release is stronger, hence safe.
@@ -2945,6 +3058,29 @@ mod tests {
     }
 
     #[test]
+    fn crc32_family() {
+        // crc32x w8, w8, x11.
+        match d(0x9acb4d08) {
+            Inst::DataProc2 { sz, op, rd, rn, rm } => {
+                assert_eq!(op, Dp2Op::Crc32x);
+                assert_eq!(sz, Sz::X); // sf: only the source register is 64-bit
+                assert_eq!((rd, rn, rm), (RegSel::Gp(8), RegSel::Gp(8), RegSel::Gp(11)));
+            }
+            other => panic!("expected DataProc2 crc32x, got {other:?}"),
+        }
+        // The eight variants; sf picks the source width and guards the two
+        // 64-bit forms (CRC32X / CRC32CX are unallocated with sf=0).
+        assert!(matches!(d(0x1ac24020), Inst::DataProc2 { op: Dp2Op::Crc32b, sz: Sz::W, .. }));
+        assert!(matches!(d(0x1ac24420), Inst::DataProc2 { op: Dp2Op::Crc32h, sz: Sz::W, .. }));
+        assert!(matches!(d(0x1ac24820), Inst::DataProc2 { op: Dp2Op::Crc32w, sz: Sz::W, .. }));
+        assert!(matches!(d(0x1ac25020), Inst::DataProc2 { op: Dp2Op::Crc32cb, sz: Sz::W, .. }));
+        assert!(matches!(d(0x1ac25420), Inst::DataProc2 { op: Dp2Op::Crc32ch, sz: Sz::W, .. }));
+        assert!(matches!(d(0x1ac25820), Inst::DataProc2 { op: Dp2Op::Crc32cw, sz: Sz::W, .. }));
+        assert!(matches!(d(0x9ac25c20), Inst::DataProc2 { op: Dp2Op::Crc32cx, sz: Sz::X, .. }));
+        assert!(matches!(d(0x1ac24c20), Inst::Unknown { .. }));
+    }
+
+    #[test]
     fn nop_and_ret() {
         assert_eq!(d(0xd503201f), Inst::Hint { imm: 0 });
         assert_eq!(
@@ -2955,6 +3091,164 @@ mod tests {
                 is_ret: true
             }
         );
+    }
+
+    #[test]
+    fn pauth_branches_drop_the_authentication() {
+        // retaa / retab are `ret x30`.
+        for w in [0xd65f0bff, 0xd65f0fff] {
+            assert_eq!(
+                d(w),
+                Inst::BranchReg {
+                    rn: RegSel::Gp(30),
+                    link: false,
+                    is_ret: true
+                }
+            );
+        }
+        // braaz x8 / braa x8, x9 / braa x8, sp branch to x8; blraaz links.
+        for w in [0xd61f091f, 0xd71f0909, 0xd71f091f] {
+            assert_eq!(
+                d(w),
+                Inst::BranchReg {
+                    rn: RegSel::Gp(8),
+                    link: false,
+                    is_ret: false
+                }
+            );
+        }
+        assert_eq!(
+            d(0xd63f091f),
+            Inst::BranchReg {
+                rn: RegSel::Gp(8),
+                link: true,
+                is_ret: false
+            }
+        );
+        // The zero-modifier forms reject a register-modifier op4, and the
+        // RET class has no register-modifier form at all.
+        assert!(matches!(d(0xd61f0909), Inst::Unknown { .. }));
+        assert!(matches!(d(0xd75f0b09), Inst::Unknown { .. }));
+    }
+
+    #[test]
+    fn pauth_register_forms_are_noops() {
+        // pacia x16, x9 / autib x30, sp / paciza x26 / xpaci x26.
+        assert_eq!(d(0xdac10130), Inst::Hint { imm: 0 });
+        assert_eq!(d(0xdac117fe), Inst::Hint { imm: 0 });
+        assert_eq!(d(0xdac123fa), Inst::Hint { imm: 0 });
+        assert_eq!(d(0xdac143fa), Inst::Hint { imm: 0 });
+        // xpacd x26, and the Z forms keep their Rn 31 requirement.
+        assert_eq!(d(0xdac147fa), Inst::Hint { imm: 0 });
+        assert!(matches!(d(0xdac1213a), Inst::Unknown { .. } | Inst::Undefined { .. }));
+    }
+
+    #[test]
+    fn pacga_writes_zero() {
+        // pacga x2, x19, x17: the PAC is uncomputable here, and what code
+        // does with one is recompute and compare, so 0 keeps both sides in
+        // agreement.
+        assert_eq!(
+            d(0x9ad13262),
+            Inst::MoveWide {
+                sz: Sz::X,
+                op: MoveOp::Movz,
+                rd: RegSel::Gp(2),
+                imm16: 0,
+                shift: 0
+            }
+        );
+    }
+
+    #[test]
+    fn ldapr_is_an_acquire_load() {
+        // ldapr x21, [x8].
+        assert_eq!(
+            d(0xf8bfc115),
+            Inst::Load {
+                sz: MemSz::D,
+                dest: Sz::X,
+                signed: false,
+                rt: RegSel::Gp(21),
+                addr: AddrMode::Offset {
+                    rn: RegSel::Gp(8),
+                    off: 0
+                },
+                order: Ordering::Acquire,
+            }
+        );
+        // ldaprb w8, [x8] / ldapr w7, [x5].
+        assert_eq!(
+            d(0x38bfc108),
+            Inst::Load {
+                sz: MemSz::B,
+                dest: Sz::W,
+                signed: false,
+                rt: RegSel::Gp(8),
+                addr: AddrMode::Offset {
+                    rn: RegSel::Gp(8),
+                    off: 0
+                },
+                order: Ordering::Acquire,
+            }
+        );
+        assert_eq!(
+            d(0xb8bfc0a7),
+            Inst::Load {
+                sz: MemSz::W,
+                dest: Sz::W,
+                signed: false,
+                rt: RegSel::Gp(7),
+                addr: AddrMode::Offset {
+                    rn: RegSel::Gp(5),
+                    off: 0
+                },
+                order: Ordering::Acquire,
+            }
+        );
+    }
+
+    #[test]
+    fn casp_swaps_a_pair() {
+        // casp x2, x3, x4, x5, [x1]: compare pair x2:x3, swap pair x4:x5.
+        assert_eq!(
+            d(0x48227c24),
+            Inst::CompareSwapPair {
+                sz: MemSz::D,
+                rs: RegSel::Gp(2),
+                rt: RegSel::Gp(4),
+                rn: RegSel::Gp(1),
+                acquire: false,
+                release: false,
+            }
+        );
+        // caspal w2, w3, w4, w5, [sp]: 32-bit pairs, acquire + release.
+        assert_eq!(
+            d(0x0862ffe4),
+            Inst::CompareSwapPair {
+                sz: MemSz::W,
+                rs: RegSel::Gp(2),
+                rt: RegSel::Gp(4),
+                rn: RegSel::Sp,
+                acquire: true,
+                release: true,
+            }
+        );
+        // An odd pair base is undefined, and ldxp stays undecoded.
+        assert!(matches!(
+            d(0x48227c25),
+            Inst::Undefined { .. } | Inst::Unknown { .. }
+        ));
+        assert!(matches!(d(0xc87f7c22), Inst::Unknown { .. }));
+    }
+
+    #[test]
+    fn tag_stores_are_noops() {
+        // stg x8, [x8] / stzg x4, [x1] / stzgm x4, [x1] / stg x4, [x1, #0x10]!
+        assert_eq!(d(0xd9200908), Inst::Hint { imm: 0 });
+        assert_eq!(d(0xd9600824), Inst::Hint { imm: 0 });
+        assert_eq!(d(0xd9200024), Inst::Hint { imm: 0 });
+        assert_eq!(d(0xd9201c24), Inst::Hint { imm: 0 });
     }
 
     #[test]

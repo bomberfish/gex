@@ -1591,9 +1591,12 @@ impl FnUnit {
                     e.line("return 0;");
                 }
             }
-            FTerm::Syscall { next_pc, next } => {
+            FTerm::Syscall { next_pc, next, imm } => {
                 e.flush();
                 e.store_pc(&format!("0x{next_pc:x}ull"));
+                if *imm != 0 {
+                    e.line(format!("GEX_C64(GEX_CTX_SYSCALL_IMM) = {imm}ull;"));
+                }
                 e.line(format!("gex_syscall(ctx, 0x{:x}ll);", b.term_pc));
                 e.invalidate();
                 match next {

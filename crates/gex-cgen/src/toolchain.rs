@@ -149,10 +149,17 @@ impl std::fmt::Display for OutOfMemory {
 impl std::error::Error for OutOfMemory {}
 
 /// A clang for one source, under [`clang_mem_mb`]'s limit.
+///
+/// The limit is installed `unix`ly except on macOS, which has no working
+/// address-space ceiling: Darwin's `setrlimit` takes `RLIMIT_AS`,
+/// `RLIMIT_DATA` and `RLIMIT_RSS` only at infinity and fails any lower value
+/// with EINVAL (the child then never starts, which reads as "is clang
+/// installed?"). Clang runs unlimited there; the ceiling is a guard against a
+/// runaway clang, not a property of the output.
 fn clang_command() -> Command {
     #[allow(unused_mut)]
     let mut cmd = Command::new(clang());
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     {
         let mb = clang_mem_mb();
         if mb != 0 {

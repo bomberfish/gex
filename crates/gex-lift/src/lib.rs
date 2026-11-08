@@ -119,6 +119,18 @@ fn order_of(o: IsaOrder) -> Order {
     }
 }
 
+/// The `i`th register of a compare-swap pair whose base is `r`: `r + i`.
+/// The encoding keeps both base registers even, so only `30 + 1` reaches
+/// 31 -- the zero register, which [`Lifter::rd_gp`] reads as 0 and
+/// [`Lifter::wr_gp`] drops.
+fn pair_next(r: RegSel, i: u8) -> RegSel {
+    match r {
+        RegSel::Gp(n) => RegSel::gp(n as u32 + i as u32),
+        // A pair base is always a plain register; the decoder says so.
+        other => other,
+    }
+}
+
 /// Carry input to [`Lifter::add_with_carry`].
 enum Carry {
     Zero,
@@ -944,7 +956,7 @@ impl<'a> Lifter<'a> {
                 Flow::End(Term::Indirect { target, is_ret })
             }
 
-            Inst::Svc { .. } => Flow::End(Term::Syscall { next }),
+            Inst::Svc { imm } => Flow::End(Term::Syscall { next, imm }),
 
             Inst::Brk { imm } => {
                 let pcv = self.b.const_i64(pc);
@@ -1167,6 +1179,42 @@ impl<'a> Lifter<'a> {
                 });
                 // CAS writes the value actually read back into Rs.
                 self.wr_gp(rs, width, old);
+                Flow::Next
+            }
+
+            Inst::CompareSwapPair { sz, rs, rt, rn, .. } => {
+                // A pair CAS as two single-element cmpxchg: exact while the
+                // world is single-threaded (nothing can change the second
+                // element between the two), and what a threaded world must
+                // replace with a real 128-bit atomic or a lock. The compare
+                // pair Rs:Rs+1 receives the pair read from memory; the swap
+                // pair Rt:Rt+1 is written on a match.
+                let ty = if sz == MemSz::D { Ty::I64 } else { Ty::I32 };
+                let width = if sz == MemSz::D { Sz::X } else { Sz::W };
+                let addr = self.rd_addr(rn);
+                let step = sz.bytes() as i64;
+                for i in 0..2 {
+                    let rsi = pair_next(rs, i);
+                    let rti = pair_next(rt, i);
+                    let elem = if i == 0 {
+                        addr
+                    } else {
+                        let off = self.b.const_i64(step as u64);
+                        self.b.bin(BinOp::Add, Ty::I64, addr, off)
+                    };
+                    let expected = self.rd_gp(rsi, width);
+                    let replacement = self.rd_gp(rti, width);
+                    let old = self.b.def(Expr::CmpXchg {
+                        addr: elem,
+                        expected,
+                        replacement,
+                        sz: mem_sz(sz),
+                        ty,
+                    });
+                    // Like CAS, each half writes what was read back into
+                    // its compare register.
+                    self.wr_gp(rsi, width, old);
+                }
                 Flow::Next
             }
 
@@ -4551,8 +4599,61 @@ impl<'a> Lifter<'a> {
             Dp2Op::Lsrv => self.b.bin(BinOp::ShrU, ty, a, b),
             Dp2Op::Asrv => self.b.bin(BinOp::ShrS, ty, a, b),
             Dp2Op::Rorv => self.b.bin(BinOp::Rotr, ty, a, b),
-            // CRC32 needs a table or a carry-less multiply; not worth an
-            // inline expansion until something in the corpus uses it.
+            Dp2Op::Crc32b
+            | Dp2Op::Crc32h
+            | Dp2Op::Crc32w
+            | Dp2Op::Crc32x
+            | Dp2Op::Crc32cb
+            | Dp2Op::Crc32ch
+            | Dp2Op::Crc32cw
+            | Dp2Op::Crc32cx => {
+                // CRC32 / CRC32C: Wn is the running CRC, updated with the low
+                // 1/2/4/8 bytes of Xm (least significant byte first) and
+                // written to Wd. The reflected bitwise form: XOR the byte in,
+                // then shift 8 times against the reversed polynomial. wasm has
+                // no carry-less multiply and no table to index, so this
+                // expands inline -- a few hundred IR nodes on the widest form.
+                let nbytes = match op {
+                    Dp2Op::Crc32b | Dp2Op::Crc32cb => 1,
+                    Dp2Op::Crc32h | Dp2Op::Crc32ch => 2,
+                    Dp2Op::Crc32w | Dp2Op::Crc32cw => 4,
+                    _ => 8,
+                };
+                // The polynomials in their reversed form, as the bit loop
+                // shifts right: 0x04C11DB7 (IEEE) / 0x1EDC6F41 (Castagnoli).
+                let poly = match op {
+                    Dp2Op::Crc32cb | Dp2Op::Crc32ch | Dp2Op::Crc32cw | Dp2Op::Crc32cx => {
+                        0x82f6_3b78u64
+                    }
+                    _ => 0xedb8_8320u64,
+                };
+                // Wn is 32-bit whatever sf says (on CRC32X only the source is
+                // 64-bit), and Wd is written 32-bit, zero-extending into Xd.
+                let mut acc = if ty == Ty::I64 { self.b.wrap(a) } else { a };
+                let one = self.konst(Ty::I32, 1);
+                let fmask = self.konst(Ty::I32, 0xff);
+                let polyv = self.konst(Ty::I32, poly);
+                for i in 0..nbytes {
+                    let sh = self.konst(ty, 8 * i);
+                    let shifted = self.b.bin(BinOp::ShrU, ty, b, sh);
+                    let byte = if ty == Ty::I64 {
+                        self.b.wrap(shifted)
+                    } else {
+                        shifted
+                    };
+                    let byte = self.b.bin(BinOp::And, Ty::I32, byte, fmask);
+                    acc = self.b.bin(BinOp::Xor, Ty::I32, acc, byte);
+                    for _ in 0..8 {
+                        let lsb = self.b.bin(BinOp::And, Ty::I32, acc, one);
+                        let mask = self.b.un(UnOp::Neg, Ty::I32, lsb);
+                        let hi = self.b.bin(BinOp::ShrU, Ty::I32, acc, one);
+                        let p = self.b.bin(BinOp::And, Ty::I32, polyv, mask);
+                        acc = self.b.bin(BinOp::Xor, Ty::I32, hi, p);
+                    }
+                }
+                self.wr_gp(rd, Sz::W, acc);
+                return Flow::Next;
+            }
             _ => return Flow::End(Term::Illegal { raw: self.raw, pc }),
         };
         self.wr_gp(rd, sz, v);

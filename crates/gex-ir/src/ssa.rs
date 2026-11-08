@@ -83,6 +83,7 @@ fn split_continuations(f: &mut Function) {
             FTerm::Syscall {
                 next: Some(e),
                 next_pc,
+                ..
             } => (*next_pc, e),
             _ => continue,
         };

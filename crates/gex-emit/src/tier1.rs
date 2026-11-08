@@ -1504,6 +1504,18 @@ impl<'a> Emitter<'a> {
         self.f.store(0x37, 3, ctx::PC as u32);
     }
 
+    /// Write the system-call immediate for the kernel to read at the call
+    /// that follows: the number of a system call whose ISA encodes it in the
+    /// instruction itself (see [`gex_ir::Term::Syscall`]). A register-numbered
+    /// call stores nothing (0 leaves the kernel reading the number register).
+    fn store_syscall_imm(&mut self, imm: u32) {
+        if imm != 0 {
+            self.ctx_base();
+            self.f.i64_const(imm as i64);
+            self.f.store(0x37, 3, ctx::SYSCALL_IMM as u32);
+        }
+    }
+
     // -- addressing --------------------------------------------------------
 
     /// Emit the 32-bit linear-memory address for `addr + offset`, returning
@@ -5084,13 +5096,19 @@ impl<'a> Emitter<'a> {
                 }
                 self.emit_dispatch_tail_call();
             }
-            Term::Syscall { next } => {
+            Term::Syscall { next, imm } => {
                 self.flush();
                 // The recorded PC is the instruction *after* the `svc`: it is
                 // where a signal frame must resume, and resuming at the `svc`
                 // itself would re-issue the syscall. The call still receives
                 // the syscall's own address, which is what a trace wants.
                 self.store_pc(next);
+                // An ISA that numbers its system calls in the instruction
+                // (`svc #imm`) leaves the number here, so the
+                // kernel does not read the number register the guest's ABI
+                // keeps live across the call (`x8` is AArch64's
+                // result-location register).
+                self.store_syscall_imm(imm);
                 self.f.local_get(self.ctx_local);
                 self.f.i64_const((block.end - gex_abi::SYSCALL_INST_BYTES) as i64);
                 self.f.call(self.cx.syscall);

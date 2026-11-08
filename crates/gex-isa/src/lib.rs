@@ -1054,6 +1054,20 @@ pub enum Inst {
         acquire: bool,
         release: bool,
     },
+    /// `casp`/`caspa`/`caspal`/`caspl` — compare and swap a *pair* of
+    /// registers against a pair in memory (FEAT_LSE). `rs` is the compare
+    /// pair `rs:rs+1`, which receives the pair read from memory; `rt` is
+    /// the swap pair `rt:rt+1`, written when the pair in memory matches.
+    /// `sz` is the size of each element. The encoding keeps both pair base
+    /// registers even, so `+1` never wraps past 31.
+    CompareSwapPair {
+        sz: MemSz,
+        rs: RegSel,
+        rt: RegSel,
+        rn: RegSel,
+        acquire: bool,
+        release: bool,
+    },
     /// `ldadd`/`ldset`/`swp`/… — atomic read-modify-write (FEAT_LSE).
     AtomicRmw {
         sz: MemSz,

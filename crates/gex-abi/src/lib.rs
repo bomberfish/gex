@@ -489,16 +489,34 @@ pub mod ctx {
     /// which never use the vector registers, so their first 64 bytes.
     pub const COMPAT_SCRATCH: usize = if super::X86 { SCRATCH } else { V };
 
-    /// Total size of the context structure, rounded up. The x87 stack and
-    /// the scratch area are x86-64's; an AArch64 context ends with `v31`.
-    pub const SIZE: usize = if super::X86 {
+    /// The context structure's own registers, before the trailing
+    /// system-call immediate. The x87 stack and the scratch area are
+    /// x86-64's; an AArch64 context ends with `v31`.
+    pub const SIZE_REGS: usize = if super::X86 {
         SCRATCH + 64
     } else {
         V + 32 * 16
     };
 
+    /// The immediate of the `svc` the guest issued, for ISAs that encode the
+    /// system-call number in the instruction itself: an AArch64 ABI that
+    /// numbers its calls `svc #imm`, with the arguments in `x0`–`x5` and no
+    /// number register to read. The emitter stores the immediate here before
+    /// it calls `gex.syscall`; an ISA whose number lives in a register
+    /// (Linux `svc #0`, x86's `syscall`) writes nothing and leaves 0, which
+    /// is what the kernel then reads as "take [`Self::SYSCALL_NR`]". A
+    /// system call's own store leaves the register file alone: `x8` is the
+    /// AArch64 result-location register and clobbering it would break the
+    /// guest's ABI across the call.
+    pub const SYSCALL_IMM: usize = SIZE_REGS;
+
+    /// Total size of the context structure, rounded up.
+    pub const SIZE: usize = SIZE_REGS + 16;
+
     /// Where the guest puts a system-call number: `x8`, or `rax` (`x(0)` in
-    /// gex's numbering of x86-64 registers, which is the hardware's).
+    /// gex's numbering of x86-64 registers, which is the hardware's). An
+    /// immediate-numbered call carries its number in
+    /// [`Self::SYSCALL_IMM`] instead.
     pub const SYSCALL_NR: usize = if super::X86 { x(0) } else { x(8) };
     /// Where the six system-call arguments arrive: `x0`–`x5`, or
     /// `rdi, rsi, rdx, r10, r8, r9`.
@@ -1351,7 +1369,11 @@ mod tests {
         assert!(ctx::X87 == ctx::v(31) + 16);
         assert!(ctx::X87 % 16 == 0 && ctx::X87_TMP % 16 == 0);
         assert!(!X86 || ctx::SIZE >= ctx::SCRATCH + 64);
-        assert!(X86 || ctx::SIZE == ctx::v(31) + 16);
+        // An AArch64 context's register file ends with `v31`, and the
+        // structure with the system-call immediate slot after it (every ISA's
+        // does; see [`ctx::SYSCALL_IMM`]).
+        assert!(X86 || ctx::SIZE_REGS == ctx::v(31) + 16);
+        assert!(ctx::SYSCALL_IMM == ctx::SIZE_REGS && ctx::SIZE == ctx::SYSCALL_IMM + 16);
         assert!(ctx::SIZE % 8 == 0);
         // The vector slots must be 16-byte aligned for `v128` accesses.
         assert!(ctx::V % 16 == 0);

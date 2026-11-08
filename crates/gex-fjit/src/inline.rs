@@ -136,7 +136,7 @@ fn inline_at(f: &mut Function, site: usize, g: &Function) {
                 table: table.clone(),
             },
             FTerm::Call { callee, ret_pc, ret } => FTerm::Call { callee: *callee, ret_pc: *ret_pc, ret: ret.as_ref().map(map) },
-            FTerm::Syscall { next_pc, next } => FTerm::Syscall { next_pc: *next_pc, next: next.as_ref().map(map) },
+            FTerm::Syscall { next_pc, next, imm } => FTerm::Syscall { next_pc: *next_pc, next: next.as_ref().map(map), imm: *imm },
             FTerm::TailCall { callee } => FTerm::Call { callee: *callee, ret_pc, ret: Some(cont.clone()) },
             // An indirect jump out of the callee is its tail call (the
             // emitter's reading of `Unresolved`), so here a call too: left
