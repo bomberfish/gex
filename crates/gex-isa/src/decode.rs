@@ -781,16 +781,35 @@ fn decode_load_store(raw: u32, pc: u64) -> Inst {
             order: Ordering::Acquire,
         };
     }
-    // FEAT_MTE's allocation-tag stores: STG/STZG/ST2G/STZ2G (any addressing
-    // mode) and the STZGM/STGM whole-block forms. The tag they store lives
-    // beside memory this world does not have, so every one is a no-op. The
-    // tag *loads* (LDG/LDGM) are left out: they write a register.
+    // FEAT_MTE's allocation-tag stores, STG/STZG/ST2G/STZ2G: opc picks the
+    // form, bits[11:10] the addressing (01 post-index, 10 offset, 11
+    // pre-index), imm9 counts 16-byte granules. The tag itself lives beside
+    // memory this world does not have, so it is dropped, but the rest is
+    // kept: the pre- and post-index forms write the base back, and STZG /
+    // STZ2G zero the one or two granules they tag. The tag loads (LDG) are
+    // left out: they write a register.
     if bits(raw, 31, 24) == 0b1101_1001 && bit(raw, 21) == 1 {
-        if bits(raw, 11, 10) != 0b00 {
-            return Inst::Hint { imm: 0 };
+        let opc = bits(raw, 23, 22);
+        let rn = RegSel::sp(bits(raw, 9, 5));
+        let off = sext(bits(raw, 20, 12), 9) << 4;
+        let addr = match bits(raw, 11, 10) {
+            0b01 => Some(AddrMode::PostIndex { rn, off }),
+            0b10 => Some(AddrMode::Offset { rn, off }),
+            0b11 => Some(AddrMode::PreIndex { rn, off }),
+            _ => None,
+        };
+        if let Some(addr) = addr {
+            let zero = match opc {
+                0b01 => 16,
+                0b11 => 32,
+                _ => 0,
+            };
+            return Inst::TagStore { addr, zero };
         }
-        if raw & 0xFFFF_FC00 == 0xD920_0000 || raw & 0xFFFF_FC00 == 0xD9A0_0000 {
-            return Inst::Hint { imm: 0 };
+        // STZGM / STGM / LDGM (bits[11:10] 00, imm9 0, opc 00 / 10 / 11)
+        // are UNDEFINED at EL0.
+        if bits(raw, 20, 12) == 0 && opc != 0b01 {
+            return Inst::Undefined { raw };
         }
     }
     // Load/store exclusive: size 001000 o2 L o1 Rs o0 Rt2 Rn Rt
@@ -3352,12 +3371,36 @@ mod tests {
     }
 
     #[test]
-    fn tag_stores_are_noops() {
-        // stg x8, [x8] / stzg x4, [x1] / stzgm x4, [x1] / stg x4, [x1, #0x10]!
-        assert_eq!(d(0xd9200908), Inst::Hint { imm: 0 });
-        assert_eq!(d(0xd9600824), Inst::Hint { imm: 0 });
-        assert_eq!(d(0xd9200024), Inst::Hint { imm: 0 });
-        assert_eq!(d(0xd9201c24), Inst::Hint { imm: 0 });
+    fn tag_stores_keep_writeback_and_zeroing() {
+        let x = |n| RegSel::sp(n);
+        // stg x8, [x8]: the tag only.
+        assert_eq!(
+            d(0xd9200908),
+            Inst::TagStore { addr: AddrMode::Offset { rn: x(8), off: 0 }, zero: 0 }
+        );
+        // stzg x4, [x1]: zeroes its granule.
+        assert_eq!(
+            d(0xd9600824),
+            Inst::TagStore { addr: AddrMode::Offset { rn: x(1), off: 0 }, zero: 16 }
+        );
+        // stg x4, [x1, #0x10]!: writes x1 back.
+        assert_eq!(
+            d(0xd9201c24),
+            Inst::TagStore { addr: AddrMode::PreIndex { rn: x(1), off: 16 }, zero: 0 }
+        );
+        // stz2g x4, [x1], #-0x20: two granules, then x1 -= 32.
+        assert_eq!(
+            d(0xd9ffe424),
+            Inst::TagStore { addr: AddrMode::PostIndex { rn: x(1), off: -32 }, zero: 32 }
+        );
+        // st2g x4, [sp, #0x40]: sp as the base.
+        assert_eq!(
+            d(0xd9a04be4),
+            Inst::TagStore { addr: AddrMode::Offset { rn: x(31), off: 64 }, zero: 0 }
+        );
+        // stzgm x4, [x1] and stgm x4, [x1]: UNDEFINED at EL0.
+        assert!(matches!(d(0xd9200024), Inst::Undefined { .. }));
+        assert!(matches!(d(0xd9a00024), Inst::Undefined { .. }));
     }
 
     #[test]

@@ -658,6 +658,14 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
                 addr_str(addr)
             )
         }
+        Inst::TagStore { ref addr, zero } => {
+            let m = match zero {
+                16 => "stzg",
+                32 => "stz2g",
+                _ => "stg",
+            };
+            format!("{m} {}", addr_str(addr))
+        }
         Inst::Prefetch { ref addr, hint } => {
             // `Rt` is really three fields: what to prefetch, into which cache
             // level, and whether to keep it there.

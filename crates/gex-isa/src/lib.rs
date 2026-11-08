@@ -1027,6 +1027,11 @@ pub enum Inst {
         rt2: RegSel,
         addr: AddrMode,
     },
+    /// `stg`/`stzg`/`st2g`/`stz2g` — store allocation tags. Tags are not
+    /// kept, so what remains is the base writeback of the pre- and
+    /// post-index forms, and for the Z forms zeroing `zero` bytes (16 or
+    /// 32, one or two granules) at the address.
+    TagStore { addr: AddrMode, zero: u32 },
     /// `prfm` — prefetch; a no-op for us but must not decode as Unknown.
     /// `hint` is the `Rt` field: type, cache level and policy.
     Prefetch { addr: AddrMode, hint: u8 },

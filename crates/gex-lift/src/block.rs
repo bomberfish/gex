@@ -302,6 +302,37 @@ mod tests {
         }
     }
 
+    /// The allocation-tag stores keep what is not the tag: `stz2g` zeroes its
+    /// two granules and the pre- and post-index forms write the base back,
+    /// while `stg` at an offset touches nothing.
+    #[test]
+    fn tag_stores_zero_and_write_back() {
+        use gex_ir::func::reg_index;
+        use gex_ir::{interp, GuestReg};
+        use std::collections::HashMap;
+        const AT: u64 = 0x10_0000;
+        // (word, x1 after, the bytes zeroed from AT)
+        for (word, x1, zeroed) in [
+            (0xd9ffe424u32, AT - 32, 0..32u64), // stz2g x4, [x1], #-0x20
+            (0xd9601c24, AT + 16, 16..32),      // stzg x4, [x1, #0x10]!
+            (0xd9200824, AT, 0..0),             // stg x4, [x1]
+            (0xd9a01424, AT + 16, 0..0),        // st2g x4, [x1], #0x10
+        ] {
+            let b = lift_block(words(0x6000, &[word, 0xd65f03c0]), 0x6000, BlockLimits::default());
+            let init: HashMap<u64, u8> = (0..48).map(|i| (AT + i, 0xa5)).collect();
+            let mut regs = interp::initial_regs(0, GuestReg::Sp);
+            regs[reg_index(GuestReg::X(1))] = AT;
+            let out = run_block_on(&b, regs, &init);
+            let mut mem = init.clone();
+            mem.extend(out.memory.iter().map(|(&a, &v)| (a, v)));
+            for i in 0..48 {
+                let want = if zeroed.contains(&i) { 0 } else { 0xa5 };
+                assert_eq!(mem[&(AT + i)], want, "{word:#010x}: byte {i}");
+            }
+            assert_eq!(out.regs[reg_index(GuestReg::X(1))], x1, "{word:#010x}: x1");
+        }
+    }
+
     /// `uaddlv h0, v0.8b` lifts (it raised SIGILL).
     #[test]
     fn add_long_across_lanes_lifts() {

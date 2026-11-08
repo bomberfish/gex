@@ -1152,6 +1152,24 @@ impl<'a> Lifter<'a> {
                 Flow::Next
             }
 
+            // The tag is not kept: zero the granules (STZG / STZ2G) and
+            // write the base back.
+            Inst::TagStore { ref addr, zero } => {
+                let a = self.address(addr);
+                let z = self.b.const_i64(0);
+                for i in 0..(zero as i64 / 8) {
+                    self.b.stmt(Stmt::Store {
+                        addr: a.base,
+                        offset: a.offset + 8 * i,
+                        val: z,
+                        sz: gex_ir::MemSz::B8,
+                        order: Order::Relaxed,
+                    });
+                }
+                self.finish_address(&a);
+                Flow::Next
+            }
+
             // Prefetch is advisory and has no writeback forms, so the whole
             // instruction is a no-op.
             Inst::Prefetch { .. } => Flow::Next,
